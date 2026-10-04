@@ -761,10 +761,12 @@ async def on_message(m: Message, bot: Bot):
 
     # пересланный пост (например, от партнёра) вне черновика: предлагаем сделать из него набор
     if m.forward_origin:
-        try:  # диагностика: как Telegram устроил пересланный пост (предпросмотр ссылки, подпись над медиа и т.д.)
-            logging.warning("FWD_DEBUG %s", str(m.model_dump(mode="json", exclude_none=True))[:3500])
+        try:  # диагностика: как Telegram устроил пересланный пост
+            f = {k: getattr(m, k, None) for k in ("text", "caption", "entities", "caption_entities", "link_preview_options",
+                 "show_caption_above_media", "has_media_spoiler", "photo", "video", "document", "animation", "web_page", "reply_markup")}
+            logging.warning("FWD_DEBUG %s", repr({k: v for k, v in f.items() if v})[:3800])
         except Exception as e:
-            logging.warning("FWD_DEBUG failed: %r | %s", e, str(m)[:3000])
+            logging.warning("FWD_DEBUG failed: %r", e)
     if m.forward_origin and not (view and view[0] == "draft"):
         data = extract(m)
         if data is None:
