@@ -57,6 +57,9 @@ async def init(dsn: str) -> None:
     await pool.execute("ALTER TABLE sets ADD COLUMN IF NOT EXISTS repeat TEXT")
     await pool.execute("CREATE TABLE IF NOT EXISTS files (token TEXT PRIMARY KEY, data BYTEA NOT NULL, mime TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now())")
     await pool.execute("DELETE FROM files f WHERE f.created_at < now() - interval '30 days' AND NOT EXISTS (SELECT 1 FROM items i WHERE i.media_url LIKE '%/m/' || f.token || '.jpg')")
+    await pool.execute("CREATE TABLE IF NOT EXISTS snaps (item_id INT NOT NULL, kind TEXT NOT NULL, views INT NOT NULL DEFAULT 0, "
+                       "forwards INT NOT NULL DEFAULT 0, reactions INT NOT NULL DEFAULT 0, replies INT NOT NULL DEFAULT 0, "
+                       "taken_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY (item_id, kind))")
     await pool.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
 
 
@@ -236,3 +239,32 @@ async def clone_set(set_id: int, start_at) -> int:
         "text_ts, media_ts, btn_text, btn_url, btns, custom_ttl, media_url, ents, plain FROM items WHERE set_id=$1 AND status<>'failed'",
         set_id, new_id)
     return new_id
+
+
+SNAP_AGES = (("1h", 60), ("6h", 360), ("24h", 1440))
+
+
+async def due_snaps(limit: int = 20) -> list[dict]:
+    """Опубликованные посты, у которых подошло время снимка (час/6 часов/сутки) и снимка ещё нет; старше 2 часов после срока не догоняем."""
+    out = []
+    for kind, mins in SNAP_AGES:
+        rows = await pool.fetch(
+            "SELECT i.id, i.ch_msg_ids, $1::text AS kind FROM items i WHERE i.status='sent' AND i.ch_msg_ids IS NOT NULL "
+            "AND i.sent_at <= now() - make_interval(mins => $2::int) AND i.sent_at > now() - make_interval(mins => $2::int + 120) "
+            "AND NOT EXISTS (SELECT 1 FROM snaps s WHERE s.item_id=i.id AND s.kind=$1::text) LIMIT $3::int", kind, mins, limit)
+        out += [dict(r) for r in rows]
+    return out[:limit]
+
+
+async def save_snap(item_id: int, kind: str, views: int, forwards: int, reactions: int, replies: int) -> None:
+    await pool.execute(
+        "INSERT INTO snaps (item_id, kind, views, forwards, reactions, replies) VALUES ($1,$2,$3,$4,$5,$6) "
+        "ON CONFLICT (item_id, kind) DO NOTHING", item_id, kind, views, forwards, reactions, replies)
+
+
+async def snap_rows(days: int) -> list[dict]:
+    rows = await pool.fetch(
+        "SELECT sn.kind AS sk, sn.views, sn.forwards, sn.reactions, sn.replies, i.role, i.media_type, i.sent_at, "
+        "i.plain AS text, s.kind AS set_kind FROM snaps sn JOIN items i ON i.id=sn.item_id JOIN sets s ON s.id=i.set_id "
+        "WHERE sn.views >= 0 AND i.sent_at > now() - make_interval(days => $1::int)", days)
+    return [dict(r) for r in rows]

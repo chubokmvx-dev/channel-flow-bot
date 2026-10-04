@@ -148,3 +148,14 @@ async def send(ch, text_ts: int | None, media_ts: int | None, text_plain: str = 
 async def delete(ch, ids: list[int]) -> None:
     peer = await _chan(ch)
     await client.delete_messages(peer, ids)
+
+
+async def stats(ch, msg_id: int) -> dict | None:
+    """Просмотры, пересылки, реакции и ответы поста в канале."""
+    peer = await _chan(ch)
+    m = await client.get_messages(peer, ids=msg_id)
+    if not m:
+        return None
+    reactions = sum(r.count for r in (m.reactions.results if m.reactions and m.reactions.results else []))
+    replies = m.replies.replies if m.replies else 0
+    return {"views": m.views or 0, "forwards": m.forwards or 0, "reactions": reactions, "replies": replies}

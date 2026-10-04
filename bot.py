@@ -30,6 +30,7 @@ from aiogram.types import (
 import config
 import db
 import planner
+import stats as stats_mod
 import userbot
 
 logging.basicConfig(level=logging.INFO)
@@ -47,7 +48,8 @@ BTN_RE = re.compile(r"^(.+?)\s*(?:\s[-–—]\s|\|)\s*((?:https?|tg)://\S+)$", r
 MAIN_KB = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="Создать пост"), KeyboardButton(text="Контент-план")],
-        [KeyboardButton(text="Изменить пост"), KeyboardButton(text="Настройки")],
+        [KeyboardButton(text="Изменить пост"), KeyboardButton(text="Статистика")],
+        [KeyboardButton(text="Настройки")],
     ],
     resize_keyboard=True,
     is_persistent=True,
@@ -326,6 +328,13 @@ def next_role_after(kind: str, items: list[dict], role: str) -> str:
 
 # ---------- экраны ----------
 
+async def v_stats():
+    if not userbot.enabled():
+        return "Статистика собирается через твой аккаунт (userbot), а он сейчас не подключён.", Kb(inline_keyboard=[[Btn(text="✖️ Закрыть", callback_data="close")]])
+    text, _ = stats_mod.build_report(await db.snap_rows(14), TZ, 14)
+    return text, Kb(inline_keyboard=[[Btn(text="🔄 Обновить", callback_data="stats"), Btn(text="✖️ Закрыть", callback_data="close")]])
+
+
 async def v_menu():
     kb = Kb(inline_keyboard=[
         [Btn(text=KIND["single"], callback_data="new:single")],
@@ -537,6 +546,8 @@ async def build_view():
         return await v_item(v[1])
     if v[0] == "plan":
         return await v_plan()
+    if v[0] == "stats":
+        return await v_stats()
     return await v_settings()
 
 
@@ -681,9 +692,30 @@ async def publish(bot: Bot, ch, it: dict) -> tuple[list[int], str]:
     return await send_item(bot, ch, it), "bot"
 
 
+_snap_fail: dict[tuple, int] = {}
+
+
+async def snapshot(ch, it: dict, kind: str) -> None:
+    key = (it["id"], kind)
+    if not (userbot.enabled() and ch and it.get("ch_msg_ids")) or _snap_fail.get(key, 0) >= 3:
+        return
+    try:
+        st = await userbot.stats(ch, int(str(it["ch_msg_ids"]).split(",")[0]))
+        if st:
+            await db.save_snap(it["id"], kind, st["views"], st["forwards"], st["reactions"], st["replies"])
+        else:  # пост уже удалён вручную: отмечаем, чтобы не опрашивать снова
+            await db.save_snap(it["id"], kind, -1, 0, 0, 0)
+    except Exception as e:
+        _snap_fail[key] = _snap_fail.get(key, 0) + 1
+        logging.warning("snapshot failed: %s", e)
+        if _snap_fail[key] >= 3:
+            await db.save_snap(it["id"], kind, -1, 0, 0, 0)
+
+
 async def tick(bot: Bot) -> None:
     ch = await channel()
     for it in await db.due_deletions():
+        await snapshot(ch, it, "final")  # цифры за минуту до удаления: потом поста уже не будет
         try:
             if ch and it["ch_msg_ids"]:
                 ids = [int(x) for x in it["ch_msg_ids"].split(",")]
@@ -712,6 +744,9 @@ async def tick(bot: Bot) -> None:
                 await db.upd_item(it["id"], status="failed")
                 await notify(bot, f"❌ Не удалось опубликовать «{html.escape(plain(it['text_html'])[:30])}»: {html.escape(str(e))}\n"
                                   "Проверь, что бот админ канала с правом публиковать сообщения.")
+    if userbot.enabled() and ch:
+        for it in await db.due_snaps():
+            await snapshot(ch, it, it["kind"])
     for sid in await db.unfinished_sets():
         await schedule_repeat(bot, sid)  # сначала следующий повтор, потом закрываем этот: при сбое не потеряем серию
         await db.upd_set(sid, status="done")  # без сообщения: оно поднимало чат с ботом выше канала
@@ -770,6 +805,11 @@ async def btn_plan(m: Message, bot: Bot):
 @router.message(F.text == "Изменить пост")
 async def btn_edit(m: Message, bot: Bot):
     await open_view(bot, ("list",), fresh=True)
+
+
+@router.message(F.text == "Статистика")
+async def btn_stats(m: Message, bot: Bot):
+    await open_view(bot, ("stats",), fresh=True)
 
 
 @router.message(F.text == "Настройки")
@@ -981,6 +1021,10 @@ async def on_cb(c: CallbackQuery, bot: Bot):
     if action == "close":
         await open_view(bot, None)
         await c.answer()
+        return
+    if action == "stats":
+        await render(bot)
+        await c.answer("Обновлено")
         return
     if action in ("plan", "list"):
         await open_view(bot, (action,))
