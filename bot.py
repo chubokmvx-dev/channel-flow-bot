@@ -248,7 +248,7 @@ async def v_draft(sid: int):
         lines += ["", f"Следующее сообщение будет: <b>{nr_label}</b>"]
     if s["kind"] == "night":
         lines.append("Ночь: разогревы и пост → напоминания 21:00, 22:00, 23:00 → в 00:00 пост 2 → напоминания 02:00, 04:00, 06:00 → в 08:00 всё удаляется. "
-                     "Если запуск поздний, график равномерно сожмётся.")
+                     "Если запуск поздний, напоминания первой части равномерно сожмутся до 00:00, пост 2 выйдет ровно в 00:00.")
     lo, hi = await start_range()
     if s["start_at"]:
         lines.append(f"🕐 Старт: {fmt(s['start_at'], True)}")
@@ -494,7 +494,10 @@ async def launch(bot: Bot, sid: int) -> str | None:
         if not any(i["role"] == "post" and i["part"] == 1 for i in items):
             return "В ночи нужен хотя бы один пост."
         start = start or n + timedelta(seconds=random.randint(lo, hi))
-        plan, p2_at, end_at = planner.plan_night(items, start, g, TZ)
+        try:
+            plan, p2_at, end_at = planner.plan_night(items, start, g, TZ)
+        except ValueError:
+            return "До 00:00 слишком мало времени для напоминаний первой части. Запусти раньше или поставь старт после 00:00 (тогда это будет следующая ночь)."
         await apply_plan(plan, items)
         await db.upd_set(sid, p2_at=p2_at, end_at=end_at)
     await db.upd_set(sid, status="scheduled", start_at=start)

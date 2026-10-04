@@ -68,8 +68,8 @@ def night_deletes(items: list[dict], send: dict, p2_at: datetime, end_at: dateti
 def plan_night(items: list[dict], start: datetime, gap: int, tz: ZoneInfo):
     """Ночь. Номинал: разогревы+пост, напоминания 21:00/22:00/23:00, в 00:00 пост 2 (часть 1 удаляется),
     напоминания 02:00/04:00/06:00, в 08:00 всё удаляется.
-    Если запуск поздний (пост 1 вышел позже номинала), весь график равномерно сжимается между
-    «первое напоминание сразу после поста» и 08:00. Возвращает (plan, p2_at, end_at)."""
+    Если запуск поздний, напоминания части 1 равномерно сжимаются между «сразу после поста» и 00:00;
+    пост 2 и часть 2 остаются на своих местах. Возвращает (plan, p2_at, end_at)."""
     g = timedelta(seconds=gap)
     warm = [i for i in items if i["role"] == "warmup"]
     posts = [i for i in items if i["role"] == "post"]
@@ -87,31 +87,27 @@ def plan_night(items: list[dict], start: datetime, gap: int, tz: ZoneInfo):
         t += g
     first_reminder_min = t  # A
 
-    local_last = last.astimezone(tz)
-    day = local_last.date()
-    if datetime.combine(day, dtime(8, 0), tzinfo=tz) <= last:
-        day += timedelta(days=1)
+    # полночь, в которую выйдет пост 2: ближайшая 00:00 после поста 1
+    day = last.astimezone(tz).date() + timedelta(days=1)
 
-    def at(d, offset_days, hour):
-        return datetime.combine(d + timedelta(days=offset_days), dtime(hour, 0), tzinfo=tz)
+    def at(offset_days, hour):
+        return datetime.combine(day + timedelta(days=offset_days), dtime(hour, 0), tzinfo=tz)
 
-    while True:
-        anchor, end = at(day, -1, 21), at(day, 0, 8)
-        if end - max(first_reminder_min, anchor) >= timedelta(hours=2):
-            break
-        day += timedelta(days=1)
+    anchor, p2_at, end = at(-1, 21), at(0, 0), at(0, 8)
+    late = first_reminder_min > anchor
+    if late and r1 and p2_at - first_reminder_min < gap_td * len(r1):
+        raise ValueError("late")
 
-    def m(nom: datetime) -> datetime:
-        if first_reminder_min <= anchor:
+    def m1(nom: datetime) -> datetime:
+        """Напоминания части 1: если запуск поздний, равномерно сжимаем между первым возможным моментом и 00:00."""
+        if not late:
             return nom
-        frac = (nom - anchor) / (end - anchor)
-        return first_reminder_min + (end - first_reminder_min) * frac
+        return first_reminder_min + (p2_at - first_reminder_min) * ((nom - anchor) / (p2_at - anchor))
 
     for i, it in enumerate(r1):
-        send[it["id"]] = m(at(day, -1, 21 + i))
-    p2_at = m(at(day, 0, 0))
+        send[it["id"]] = m1(at(-1, 21 + i))
     if p2:
-        send[p2["id"]] = p2_at
+        send[p2["id"]] = p2_at          # пост 2 всегда ровно в 00:00
     for i, it in enumerate(r2):
-        send[it["id"]] = m(at(day, 0, 2 + 2 * i))
+        send[it["id"]] = at(0, 2 + 2 * i)  # 02:00, 04:00, 06:00
     return night_deletes(items, send, p2_at, end), p2_at, end
