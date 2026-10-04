@@ -52,8 +52,11 @@ async def init(dsn: str) -> None:
     await pool.execute("ALTER TABLE sets ADD COLUMN IF NOT EXISTS paused BOOLEAN NOT NULL DEFAULT false")
     await pool.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS media_url TEXT")
     await pool.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS btns TEXT")
+    await pool.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS ents TEXT")
+    await pool.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS plain TEXT")
+    await pool.execute("ALTER TABLE sets ADD COLUMN IF NOT EXISTS repeat TEXT")
     await pool.execute("CREATE TABLE IF NOT EXISTS files (token TEXT PRIMARY KEY, data BYTEA NOT NULL, mime TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now())")
-    await pool.execute("DELETE FROM files WHERE created_at < now() - interval '30 days'")
+    await pool.execute("DELETE FROM files f WHERE created_at < now() - interval '30 days' AND NOT EXISTS (SELECT 1 FROM items i WHERE i.media_url LIKE '%/m/' || f.token || '.jpg')'")
     await pool.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
 
 
@@ -125,10 +128,10 @@ async def add_item(set_id: int, role: str, part: int, fields: dict, status: str,
         pos = (await pool.fetchval("SELECT coalesce(max(pos),0) FROM items WHERE set_id=$1", set_id)) + 1
     return await pool.fetchval(
         "INSERT INTO items (set_id, role, part, pos, text_html, media_type, file_id, status, src_chat, src_msg, "
-        "text_msg, media_msg, text_ts, media_ts, btn_text, btn_url, media_url, btns) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING id",
+        "text_msg, media_msg, text_ts, media_ts, btn_text, btn_url, media_url, btns, ents, plain) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20) RETURNING id",
         set_id, role, part, pos, fields.get("text_html", ""), fields.get("media_type"), fields.get("file_id"), status,
         fields.get("src_chat"), fields.get("src_msg"), fields.get("text_msg"), fields.get("media_msg"),
-        fields.get("text_ts"), fields.get("media_ts"), fields.get("btn_text"), fields.get("btn_url"), fields.get("media_url"), fields.get("btns"),
+        fields.get("text_ts"), fields.get("media_ts"), fields.get("btn_text"), fields.get("btn_url"), fields.get("media_url"), fields.get("btns"), fields.get("ents"), fields.get("plain"),
     )
 
 
@@ -218,3 +221,18 @@ async def put_file(token: str, data: bytes, mime: str) -> None:
 async def get_file(token: str):
     r = await pool.fetchrow("SELECT data, mime FROM files WHERE token=$1", token)
     return (bytes(r["data"]), r["mime"]) if r else None
+
+
+async def clone_set(set_id: int, start_at) -> int:
+    """Копия набора для следующего повтора: те же сообщения, кнопки, таймеры; ничего ещё не опубликовано."""
+    src = await get_set(set_id)
+    new_id = await pool.fetchval(
+        "INSERT INTO sets (kind, next_role, start_at, repeat) VALUES ($1,$2,$3,$4) RETURNING id",
+        src["kind"], src["next_role"], start_at, src["repeat"])
+    await pool.execute(
+        "INSERT INTO items (set_id, role, part, pos, text_html, media_type, file_id, status, src_chat, src_msg, text_msg, media_msg, "
+        "text_ts, media_ts, btn_text, btn_url, btns, custom_ttl, media_url, ents, plain) "
+        "SELECT $2, role, part, pos, text_html, media_type, file_id, 'draft', src_chat, src_msg, text_msg, media_msg, "
+        "text_ts, media_ts, btn_text, btn_url, btns, custom_ttl, media_url, ents, plain FROM items WHERE set_id=$1 AND status<>'failed'",
+        set_id, new_id)
+    return new_id

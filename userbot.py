@@ -1,6 +1,7 @@
 """Публикация и удаление в канале от имени аккаунта владельца (чтобы работали премиум-эмодзи).
 Содержимое берём из его же сообщений в чате с ботом: так сохраняются все entities, включая custom emoji."""
 import copy
+import json
 import logging
 import random
 
@@ -63,6 +64,33 @@ async def _find(ts: int, text: str | None = None, want_media: bool = False):
     return cands[0] if cands else None
 
 
+_ENT = {
+    "bold": types.MessageEntityBold, "italic": types.MessageEntityItalic, "underline": types.MessageEntityUnderline,
+    "strikethrough": types.MessageEntityStrike, "spoiler": types.MessageEntitySpoiler, "code": types.MessageEntityCode,
+    "url": types.MessageEntityUrl, "mention": types.MessageEntityMention, "hashtag": types.MessageEntityHashtag,
+    "cashtag": types.MessageEntityCashtag, "bot_command": types.MessageEntityBotCommand, "email": types.MessageEntityEmail,
+    "phone_number": types.MessageEntityPhone,
+}
+
+
+def entities_from_json(raw: str | None) -> list:
+    """Entities, сохранённые из сообщения бота (aiogram), превращаем в Telethon: так посту не нужно искать исходное сообщение."""
+    out = []
+    for d in json.loads(raw) if raw else []:
+        t, o, n = d["type"], d["offset"], d["length"]
+        if t == "text_link":
+            out.append(types.MessageEntityTextUrl(offset=o, length=n, url=d.get("url") or ""))
+        elif t == "custom_emoji":
+            out.append(types.MessageEntityCustomEmoji(offset=o, length=n, document_id=int(d["custom_emoji_id"])))
+        elif t == "pre":
+            out.append(types.MessageEntityPre(offset=o, length=n, language=d.get("language") or ""))
+        elif t in ("blockquote", "expandable_blockquote"):
+            out.append(types.MessageEntityBlockquote(offset=o, length=n, collapsed=(t == "expandable_blockquote")))
+        elif t in _ENT:
+            out.append(_ENT[t](offset=o, length=n))
+    return out
+
+
 async def _send_framed(peer, text: str, ents, url: str) -> int:
     """Текст + картинка как большой предпросмотр ссылки под текстом (скрытая ссылка на картинку в начале поста)."""
     shifted = []
@@ -81,20 +109,25 @@ async def _send_framed(peer, text: str, ents, url: str) -> int:
 
 
 async def send(ch, text_ts: int | None, media_ts: int | None, text_plain: str = "",
-               media_url: str | None = None, keep_preview: bool = False) -> list[int]:
+               media_url: str | None = None, keep_preview: bool = False,
+               stored_text: str | None = None, stored_ents: str | None = None) -> list[int]:
     peer = await _chan(ch)
-    tm = await _find(text_ts, text_plain) if text_ts else None
-    if text_ts and not tm:
-        raise RuntimeError("исходное сообщение в чате с ботом не найдено (удалено или слишком старое?)")
-    text = (tm.message if tm else "") or ""
-    ents = (tm.entities if tm else None) or None
+    if stored_text is not None:
+        tm = None
+        text, ents = stored_text, entities_from_json(stored_ents) or None
+    else:
+        tm = await _find(text_ts, text_plain) if text_ts else None
+        if text_ts and not tm:
+            raise RuntimeError("исходное сообщение в чате с ботом не найдено (удалено или слишком старое?)")
+        text = (tm.message if tm else "") or ""
+        ents = (tm.entities if tm else None) or None
     if media_url and text.strip():
         try:
             return [await _send_framed(peer, text, ents, media_url)]
         except Exception as e:
             logging.warning("framed send failed, fallback to attached media: %s", e)
     if media_ts:
-        mm = tm if (tm is not None and media_ts == text_ts and tm.media) else await _find(media_ts, None, True)
+        mm = tm if (tm is not None and media_ts == text_ts and tm.media) else await _find(media_ts, None, True)  # у stored_text медиа ищем по своему времени
         if not mm:
             raise RuntimeError("исходное сообщение в чате с ботом не найдено (удалено или слишком старое?)")
         if len(text) <= 1024:

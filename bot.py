@@ -152,6 +152,12 @@ def extract(m: Message) -> dict | None:
             # ID сообщений в личке у бота и у пользователя разные, поэтому для userbot ищем по времени отправки
             "text_ts": int(m.date.timestamp()) if (m.text or m.caption) else None,
             "media_ts": int(m.date.timestamp()) if media_type else None}
+    raw = m.text if m.text is not None else m.caption
+    if raw is not None:  # сохраняем сам текст и его entities (в т.ч. премиум-эмодзи): публикация не зависит от исходного сообщения
+        ents = m.entities if m.text is not None else m.caption_entities
+        d["plain"] = raw
+        d["ents"] = json.dumps([{"type": e.type, "offset": e.offset, "length": e.length, "url": e.url,
+                                 "language": e.language, "custom_emoji_id": e.custom_emoji_id} for e in (ents or [])])
     if btns:  # кнопки есть только у пересланных постов; у обычных сообщений не затираем уже заданные
         d["btns"] = json.dumps(btns, ensure_ascii=False)
     return d
@@ -367,9 +373,27 @@ async def v_draft(sid: int):
             extra.insert(0, Btn(text="↩️ Убрать последнее", callback_data=f"rl:{sid}"))
         rows.append(extra)
     go = ("✅ Запланировать" if s["start_at"] else "🚀 Опубликовать") if s["kind"] == "single" else "🚀 Запустить"
+    lines.append("🔁 Повтор: " + (REPEAT[s["repeat"]] if s["repeat"] else "нет"))
+    rows.append([Btn(text=("✓ " if (s["repeat"] or "none") == k else "") + t, callback_data=f"rep:{sid}:{k}")
+                 for k, t in (("none", "Без повтора"), ("daily", "День"), ("weekly", "Неделя"), ("monthly", "Месяц"))])
     rows.append([Btn(text="🕐 Время", callback_data=f"tp:{sid}"), Btn(text=go, callback_data=f"go:{sid}")])
     rows.append([Btn(text="❌ Отмена", callback_data=f"x:{sid}")])
     return "\n".join(lines), Kb(inline_keyboard=rows)
+
+
+REPEAT = {"daily": "каждый день", "weekly": "каждую неделю", "monthly": "каждый месяц"}
+
+
+def add_period(dt: datetime, kind: str) -> datetime:
+    """Следующее срабатывание в то же местное время суток."""
+    dt = dt.astimezone(TZ)
+    if kind == "daily":
+        return dt + timedelta(days=1)
+    if kind == "weekly":
+        return dt + timedelta(days=7)
+    y, mo = (dt.year + 1, 1) if dt.month == 12 else (dt.year, dt.month + 1)
+    last = [31, 29 if y % 4 == 0 and (y % 100 or y % 400 == 0) else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][mo - 1]
+    return dt.replace(year=y, month=mo, day=min(dt.day, last))
 
 
 async def v_list():
@@ -379,7 +403,8 @@ async def v_list():
         if s["status"] == "draft" and not s["n"]:
             continue
         when = "черновик" if s["status"] == "draft" else f"дальше {fmt(s['next_at'])}" if s["next_at"] else "идёт удаление"
-        kb.append([Btn(text=f"{KIND[s['kind']]} · {s['n']} шт. · {when}", callback_data=f"set:{s['id']}")])
+        rep = " 🔁" if s["repeat"] else ""
+        kb.append([Btn(text=f"{KIND[s['kind']]}{rep} · {s['n']} шт. · {when}", callback_data=f"set:{s['id']}")])
     if not kb:
         return "Пока нет постов для изменения. Нажми «Создать пост».", Kb(inline_keyboard=[[Btn(text="✖️ Закрыть", callback_data="close")]])
     kb.append([Btn(text="✖️ Закрыть", callback_data="close")])
@@ -391,7 +416,7 @@ async def v_set(sid: int):
     if not s or s["status"] != "scheduled":
         return await v_list()
     items = await db.items_of(sid)
-    lines = [f"<b>{KIND[s['kind']]}</b>" + (" · ⏸ на паузе" if s["paused"] else ""), ""]
+    lines = [f"<b>{KIND[s['kind']]}</b>" + (" · ⏸ на паузе" if s["paused"] else "") + (f" · 🔁 {REPEAT[s['repeat']]}" if s["repeat"] else ""), ""]
     kb = []
     has_pending = any(i["status"] == "pending" for i in items)
     for it in items:
@@ -408,6 +433,8 @@ async def v_set(sid: int):
         elif it["status"] == "failed":
             lines.append(f"❌ {label(it, s['kind'])}: не опубликовано")
     kb = kb[:28]
+    if has_pending and not any(i["status"] in ("sent", "deleted") for i in items):
+        kb.insert(0, [Btn(text="🕐 Изменить время", callback_data=f"tp:{sid}")])
     if has_pending:
         kb.insert(0, [Btn(text="▶️ Продолжить" if s["paused"] else "⏸ Пауза", callback_data=f"pz:{sid}")])
         if not s["paused"]:
@@ -639,7 +666,8 @@ async def publish(bot: Bot, ch, it: dict) -> tuple[list[int], str]:
     if userbot.enabled() and (it["text_ts"] or it["media_ts"]):
         try:
             ids = await userbot.send(ch, it["text_ts"], it["media_ts"], plain(it["text_html"]),
-                                     it["media_url"] if it["media_type"] == "photo" else None, hidden_preview(it))
+                                     it["media_url"] if it["media_type"] == "photo" else None, hidden_preview(it),
+                                     it.get("plain"), it.get("ents"))
             if get_btns(it):
                 try:  # кнопки-ссылки может добавить только бот; ему нужно право «Редактирование сообщений»
                     await bot.edit_message_reply_markup(chat_id=ch, message_id=ids[-1], reply_markup=markup(it))
@@ -685,7 +713,25 @@ async def tick(bot: Bot) -> None:
                 await notify(bot, f"❌ Не удалось опубликовать «{html.escape(plain(it['text_html'])[:30])}»: {html.escape(str(e))}\n"
                                   "Проверь, что бот админ канала с правом публиковать сообщения.")
     for sid in await db.unfinished_sets():
+        await schedule_repeat(bot, sid)  # сначала следующий повтор, потом закрываем этот: при сбое не потеряем серию
         await db.upd_set(sid, status="done")  # без сообщения: оно поднимало чат с ботом выше канала
+
+
+async def schedule_repeat(bot: Bot, sid: int) -> None:
+    """Набор с повтором: ставим следующий такой же на следующий период в то же время."""
+    s = await db.get_set(sid)
+    if not s or not s["repeat"] or not s["start_at"]:
+        return
+    nxt = add_period(s["start_at"], s["repeat"])
+    guard = 0
+    while nxt <= now() and guard < 400:  # бот долго не работал: пропускаем прошедшие даты
+        nxt = add_period(nxt, s["repeat"])
+        guard += 1
+    new_id = await db.clone_set(sid, nxt)
+    err = await launch(bot, new_id)
+    if err:
+        await db.upd_set(new_id, status="cancelled")
+        await notify(bot, f"⚠️ Повтор «{KIND[s['kind']]}» на {fmt(nxt, True)} не поставлен: {html.escape(err)}")
 
 
 async def worker(bot: Bot) -> None:
@@ -795,8 +841,7 @@ async def on_message(m: Message, bot: Bot):
         if not when:
             await tmp(bot, "Не понял время. Примеры: 21:30 или 05.10 08:00")
             return
-        await db.upd_set(cur[1], start_at=when)
-        await finish_set_time(bot, cur[1], fresh=True)
+        await apply_time(bot, cur[1], when, fresh=True)
         return
 
     if cur and cur[0] == "btn":
@@ -835,7 +880,8 @@ async def on_message(m: Message, bot: Bot):
                 await db.upd_item(cur[1], **data)
             else:
                 # у поста есть медиа: меняем только текст, медиа остаётся
-                await db.upd_item(cur[1], text_html=data["text_html"], text_msg=data["text_msg"], text_ts=data["text_ts"], src_msg=None)
+                await db.upd_item(cur[1], text_html=data["text_html"], text_msg=data["text_msg"], text_ts=data["text_ts"], src_msg=None,
+                                  plain=data.get("plain"), ents=data.get("ents"))
             await after_item_change(bot, cur[1], fresh=True)
         else:
             it = await db.get_item(cur[1])
@@ -888,6 +934,18 @@ async def after_item_change(bot: Bot, item_id: int, fresh: bool = False) -> None
         if s and s["status"] == "scheduled":
             await replan(s["id"])
     await render(bot, fresh)
+
+
+async def apply_time(bot: Bot, sid: int, when, fresh: bool = False) -> None:
+    """Новое время старта. У уже запущенного набора (пока ничего не вышло) расписание пересчитывается сразу."""
+    await db.upd_set(sid, start_at=when)
+    s = await db.get_set(sid)
+    err = None
+    if s and s["status"] == "scheduled":
+        err = await launch(bot, sid)
+    await finish_set_time(bot, sid, fresh)
+    if err:
+        await tmp(bot, "⚠️ " + err)
 
 
 async def finish_set_time(bot: Bot, sid: int, fresh: bool = False) -> None:
@@ -987,6 +1045,12 @@ async def on_cb(c: CallbackQuery, bot: Bot):
         await open_view(bot, None)
         await c.answer("Отменено")
         return
+    if action == "rep":
+        sid, k = int(parts[0]), parts[1]
+        await db.upd_set(sid, repeat=None if k == "none" else k)
+        await render(bot)
+        await c.answer()
+        return
     if action == "tp":
         sid = int(parts[0])
         s = await db.get_set(sid)
@@ -1003,8 +1067,7 @@ async def on_cb(c: CallbackQuery, bot: Bot):
         return
     if action == "ts":
         sid, ts = int(parts[0]), int(parts[1])
-        await db.upd_set(sid, start_at=datetime.fromtimestamp(ts, TZ) if ts else None)
-        await finish_set_time(bot, sid)
+        await apply_time(bot, sid, datetime.fromtimestamp(ts, TZ) if ts else None)
         await c.answer()
         return
     if action == "go":
