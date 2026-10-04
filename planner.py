@@ -30,6 +30,14 @@ def plan_mutual(items: list[dict], start: datetime, gap: int, now: datetime) -> 
             send[it["id"]] = cursor
             cursor += g
     ordered = [it for it in items if it["id"] in send]
+
+    def group_end(j: int):
+        nxt = next((o for o in ordered[j + 1:] if o["role"] == "post"), None)
+        if nxt:
+            return send[nxt["id"]]
+        rems = [o for o in ordered[j + 1:] if o["role"] == "reminder"]
+        return send[rems[-1]["id"]] + g if rems else None
+
     out = {}
     for i, it in enumerate(ordered):
         s = send[it["id"]]
@@ -38,13 +46,10 @@ def plan_mutual(items: list[dict], start: datetime, gap: int, now: datetime) -> 
             if it["role"] == "reminder":
                 d = send[ordered[i + 1]["id"]] if i + 1 < len(ordered) else s + g
             else:
-                # разогрев удаляется вместе со «своим» постом, то есть когда выходит следующий пост после него;
-                # сам пост удаляется, когда выходит следующий пост
-                rest = ordered[i + 1:]
-                if it["role"] == "warmup":
-                    k = next((n for n, o in enumerate(rest) if o["role"] == "post"), None)
-                    rest = rest[k + 1:] if k is not None else []
-                d = next((send[o["id"]] for o in rest if o["role"] == "post"), None)
+                # группа = разогревы + их пост. Удаляется целиком, когда выходит следующий пост;
+                # у последнего поста, когда уходит его последнее напоминание (если напоминаний нет, остаётся)
+                j = i if it["role"] == "post" else next((n for n in range(i + 1, len(ordered)) if ordered[n]["role"] == "post"), None)
+                d = group_end(j) if j is not None else None
         out[it["id"]] = (s, d)
     return out
 

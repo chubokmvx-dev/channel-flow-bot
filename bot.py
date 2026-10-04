@@ -990,6 +990,9 @@ async def main() -> None:
     dp = Dispatcher()
     dp.include_router(router)
     await userbot.start((await bot.get_me()).username)
+    for s in await db.active_sets():  # пересчитываем расписание уже запущенных наборов по актуальным правилам
+        if s["status"] == "scheduled":
+            await replan(s["id"])
     asyncio.create_task(worker(bot))
     await bot.delete_webhook(drop_pending_updates=False)
     await dp.start_polling(bot)
