@@ -760,6 +760,11 @@ async def on_message(m: Message, bot: Bot):
         return
 
     # пересланный пост (например, от партнёра) вне черновика: предлагаем сделать из него набор
+    if m.forward_origin:
+        try:  # диагностика: как Telegram устроил пересланный пост (предпросмотр ссылки, подпись над медиа и т.д.)
+            logging.warning("FWD_DEBUG %s", m.model_dump_json(exclude_none=True, exclude={"from_user", "chat", "sender_chat"})[:3000])
+        except Exception:
+            pass
     if m.forward_origin and not (view and view[0] == "draft"):
         data = extract(m)
         if data is None:
