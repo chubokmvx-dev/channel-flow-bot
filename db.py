@@ -56,7 +56,7 @@ async def init(dsn: str) -> None:
     await pool.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS plain TEXT")
     await pool.execute("ALTER TABLE sets ADD COLUMN IF NOT EXISTS repeat TEXT")
     await pool.execute("CREATE TABLE IF NOT EXISTS files (token TEXT PRIMARY KEY, data BYTEA NOT NULL, mime TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now())")
-    await pool.execute("DELETE FROM files f WHERE created_at < now() - interval '30 days' AND NOT EXISTS (SELECT 1 FROM items i WHERE i.media_url LIKE '%/m/' || f.token || '.jpg')'")
+    await pool.execute("DELETE FROM files f WHERE f.created_at < now() - interval '30 days' AND NOT EXISTS (SELECT 1 FROM items i WHERE i.media_url LIKE '%/m/' || f.token || '.jpg')")
     await pool.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
 
 
