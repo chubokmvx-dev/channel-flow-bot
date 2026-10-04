@@ -1,5 +1,8 @@
 import asyncio
 import html
+import io
+import os
+import secrets
 import logging
 import random
 import re
@@ -13,6 +16,7 @@ from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import (
+    LinkPreviewOptions,
     CallbackQuery,
     InlineKeyboardButton as Btn,
     InlineKeyboardMarkup as Kb,
@@ -154,9 +158,42 @@ def markup(it: dict) -> Kb | None:
     return None
 
 
+HID_RE = re.compile(r'^\s*<a href="[^"]+">\u200b</a>')
+
+
+def hidden_preview(it: dict) -> bool:
+    """Пост начинается со скрытой ссылки (невидимый символ): предпросмотр этой ссылки нужен, он и показывает картинку."""
+    return bool(HID_RE.match(it.get("text_html") or ""))
+
+
+def public_base() -> str | None:
+    d = os.environ.get("RAILWAY_PUBLIC_DOMAIN")
+    return f"https://{d}" if d else (os.environ.get("PUBLIC_URL") or None)
+
+
+async def host_photo(bot: Bot, data: dict) -> None:
+    """Фото выкладываем по своей ссылке: так оно выходит как большой предпросмотр под текстом, а не вложением."""
+    data["media_url"] = None
+    base = public_base()
+    if not base or data.get("media_type") != "photo":
+        return
+    try:
+        buf = io.BytesIO()
+        await bot.download(data["file_id"], destination=buf)
+        token = secrets.token_urlsafe(9).replace("-", "a").replace("_", "b")
+        await db.put_file(token, buf.getvalue(), "image/jpeg")
+        data["media_url"] = f"{base}/m/{token}.jpg"
+    except Exception:
+        logging.exception("host_photo failed")
+
+
 async def send_item(bot: Bot, chat, it: dict) -> list[int]:
     kb, text, mt, fid = markup(it), it["text_html"] or "", it["media_type"], it["file_id"]
-    if it.get("src_msg"):
+    if it.get("media_url") and mt == "photo" and text.strip():
+        url = it["media_url"]
+        opts = LinkPreviewOptions(url=url, prefer_large_media=True, show_above_text=False)
+        return [(await bot.send_message(chat, f'<a href="{url}">\u200b</a>' + text, reply_markup=kb, link_preview_options=opts)).message_id]
+    if it.get("src_msg") and (mt or hidden_preview(it)):
         # копируем исходное сообщение целиком: так сохраняются премиум-эмодзи и всё форматирование
         try:
             extra = {"show_caption_above_media": True} if mt in ("photo", "video", "animation") and text else {}
@@ -165,7 +202,8 @@ async def send_item(bot: Bot, chat, it: dict) -> list[int]:
         except Exception as e:
             logging.warning("copy_message failed, sending manually: %s", e)
     if not mt:
-        return [(await bot.send_message(chat, text or "…", reply_markup=kb)).message_id]
+        opts = LinkPreviewOptions(is_disabled=False, prefer_large_media=True) if hidden_preview(it) else LinkPreviewOptions(is_disabled=True)
+        return [(await bot.send_message(chat, text or "…", reply_markup=kb, link_preview_options=opts)).message_id]
     sender = {"photo": bot.send_photo, "video": bot.send_video, "animation": bot.send_animation,
               "document": bot.send_document}[mt]
     if len(text) <= 1024:
@@ -554,7 +592,8 @@ async def publish(bot: Bot, ch, it: dict) -> tuple[list[int], str]:
     """Публикует в канал. Если подключён userbot, то от имени аккаунта владельца (работают премиум-эмодзи)."""
     if userbot.enabled() and (it["text_ts"] or it["media_ts"]):
         try:
-            ids = await userbot.send(ch, it["text_ts"], it["media_ts"], plain(it["text_html"]))
+            ids = await userbot.send(ch, it["text_ts"], it["media_ts"], plain(it["text_html"]),
+                                     it["media_url"] if it["media_type"] == "photo" else None, hidden_preview(it))
             if it["btn_url"]:
                 try:  # кнопки-ссылки может добавить только бот; ему нужно право «Редактирование сообщений»
                     await bot.edit_message_reply_markup(chat_id=ch, message_id=ids[-1], reply_markup=markup(it))
@@ -731,12 +770,14 @@ async def on_message(m: Message, bot: Bot):
         if data is None:
             await tmp(bot, "Этот тип сообщения не поддерживается. Отправь текст, фото, видео, гиф или файл.")
             return
+        await host_photo(bot, data)
         if cur[0] == "media":
             if not data["media_type"]:
                 await tmp(bot, "Нужно фото, видео, гиф или файл.")
                 return
             await db.upd_item(cur[1], media_type=data["media_type"], file_id=data["file_id"],
-                              media_msg=data["media_msg"], media_ts=data["media_ts"], src_msg=None)
+                              media_msg=data["media_msg"], media_ts=data["media_ts"], src_msg=None,
+                              media_url=data["media_url"])
             await after_item_change(bot, cur[1], fresh=True)
         elif cur[0] == "repl":
             await db.upd_item(cur[1], **data)
@@ -778,6 +819,7 @@ async def on_message(m: Message, bot: Bot):
             if b:
                 data["btn_text"], data["btn_url"] = b.text[:60], b.url
                 break
+        await host_photo(bot, data)
         global fwd
         fwd = data
         await clear_tmp(bot)
@@ -793,6 +835,7 @@ async def on_message(m: Message, bot: Bot):
         s = await db.get_set(view[1])
         data = extract(m)
         if s and data:
+            await host_photo(bot, data)
             await clear_tmp(bot)
             await add_to_draft(bot, s, data)
             await render(bot, fresh=True)   # панель всегда под последним сообщением
@@ -1031,7 +1074,7 @@ async def on_cb(c: CallbackQuery, bot: Bot):
             mode = ("txt", iid)
             await tmp(bot, "Отправь новый текст (форматирование и эмодзи сохранятся). Медиа останется на месте.", cancel_kb)
         elif action == "mx":
-            await db.upd_item(iid, media_type=None, file_id=None, media_msg=None, media_ts=None, src_msg=None)
+            await db.upd_item(iid, media_type=None, file_id=None, media_msg=None, media_ts=None, src_msg=None, media_url=None)
             await after_item_change(bot, iid)
         elif action == "bt":
             await clear_tmp(bot)
@@ -1080,8 +1123,30 @@ async def on_cb(c: CallbackQuery, bot: Bot):
     await c.answer()
 
 
+async def start_web() -> None:
+    """Отдаёт загруженные фото по публичной ссылке (Telegram берёт по ней предпросмотр)."""
+    from aiohttp import web
+
+    async def media(request):
+        f = await db.get_file(request.match_info["token"])
+        if not f:
+            raise web.HTTPNotFound()
+        return web.Response(body=f[0], content_type=f[1], headers={"Cache-Control": "public, max-age=86400"})
+
+    app = web.Application()
+    async def root(request):
+        return web.Response(text="ok")
+
+    app.router.add_get("/", root)
+    app.router.add_get("/m/{token}.jpg", media)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", "8080"))).start()
+
+
 async def main() -> None:
     await db.init(config.DATABASE_URL)
+    await start_web()
     bot = Bot(config.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
     dp.include_router(router)

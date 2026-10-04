@@ -1,9 +1,12 @@
 """Публикация и удаление в канале от имени аккаунта владельца (чтобы работали премиум-эмодзи).
 Содержимое берём из его же сообщений в чате с ботом: так сохраняются все entities, включая custom emoji."""
+import copy
 import logging
+import random
 
 from telethon import TelegramClient
 from telethon.sessions import StringSession
+from telethon.tl import functions, types
 
 import config
 
@@ -60,31 +63,52 @@ async def _find(ts: int, text: str | None = None, want_media: bool = False):
     return cands[0] if cands else None
 
 
-async def send(ch, text_ts: int | None, media_ts: int | None, text_plain: str = "") -> list[int]:
+async def _send_framed(peer, text: str, ents, url: str) -> int:
+    """Текст + картинка как большой предпросмотр ссылки под текстом (скрытая ссылка на картинку в начале поста)."""
+    shifted = []
+    for e in ents or []:
+        e2 = copy.copy(e)
+        e2.offset += 1  # впереди добавляем один невидимый символ
+        shifted.append(e2)
+    shifted.insert(0, types.MessageEntityTextUrl(offset=0, length=1, url=url))
+    res = await client(functions.messages.SendMediaRequest(
+        peer=peer, media=types.InputMediaWebPage(url=url, force_large_media=True), message="\u200b" + text,
+        random_id=random.randrange(-2**63, 2**63), entities=shifted))
+    for u in getattr(res, "updates", []) or []:
+        if isinstance(u, (types.UpdateNewMessage, types.UpdateNewChannelMessage)):
+            return u.message.id
+    raise RuntimeError("не удалось получить id опубликованного сообщения")
+
+
+async def send(ch, text_ts: int | None, media_ts: int | None, text_plain: str = "",
+               media_url: str | None = None, keep_preview: bool = False) -> list[int]:
     peer = await _chan(ch)
     tm = await _find(text_ts, text_plain) if text_ts else None
-    if media_ts:
-        mm = tm if (tm is not None and media_ts == text_ts and tm.media) else await _find(media_ts, None, True)
-    else:
-        mm = None
-    if (text_ts and not tm) or (media_ts and not mm):
+    if text_ts and not tm:
         raise RuntimeError("исходное сообщение в чате с ботом не найдено (удалено или слишком старое?)")
     text = (tm.message if tm else "") or ""
     ents = (tm.entities if tm else None) or None
-    if mm:
+    if media_url and text.strip():
+        try:
+            return [await _send_framed(peer, text, ents, media_url)]
+        except Exception as e:
+            logging.warning("framed send failed, fallback to attached media: %s", e)
+    if media_ts:
+        mm = tm if (tm is not None and media_ts == text_ts and tm.media) else await _find(media_ts, None, True)
+        if not mm:
+            raise RuntimeError("исходное сообщение в чате с ботом не найдено (удалено или слишком старое?)")
         if len(text) <= 1024:
-            # одно сообщение: текст сверху, медиа под ним
             try:
                 m = await client.send_file(peer, mm.media, caption=text or None, formatting_entities=ents, invert_media=True)
             except TypeError:  # старая версия Telethon без invert_media
                 m = await client.send_file(peer, mm.media, caption=text or None, formatting_entities=ents)
             return [m.id]
-        first = await client.send_message(peer, text, formatting_entities=ents)
+        first = await client.send_message(peer, text, formatting_entities=ents, link_preview=False)
         second = await client.send_file(peer, mm.media)
         return [first.id, second.id]
     if not text:
         raise RuntimeError("нечего публиковать")
-    m = await client.send_message(peer, text, formatting_entities=ents)
+    m = await client.send_message(peer, text, formatting_entities=ents, link_preview=keep_preview)
     return [m.id]
 
 
