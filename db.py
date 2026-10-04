@@ -49,6 +49,7 @@ async def init(dsn: str) -> None:
     await pool.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS via TEXT")
     await pool.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS text_ts BIGINT")
     await pool.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS media_ts BIGINT")
+    await pool.execute("ALTER TABLE sets ADD COLUMN IF NOT EXISTS paused BOOLEAN NOT NULL DEFAULT false")
     await pool.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
 
 
@@ -172,7 +173,7 @@ async def mark_sent(item_id: int, msg_ids: list[int], via: str = "bot") -> None:
 async def due_sends() -> list[dict]:
     rows = await pool.fetch(
         "SELECT i.* FROM items i JOIN sets s ON s.id=i.set_id "
-        "WHERE s.status='scheduled' AND i.status='pending' AND i.send_at <= now() ORDER BY i.send_at, i.pos"
+        "WHERE s.status='scheduled' AND NOT s.paused AND i.status='pending' AND i.send_at <= now() ORDER BY i.send_at, i.pos"
     )
     return [dict(r) for r in rows]
 

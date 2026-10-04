@@ -304,8 +304,9 @@ async def v_set(sid: int):
     if not s or s["status"] != "scheduled":
         return await v_list()
     items = await db.items_of(sid)
-    lines = [f"<b>{KIND[s['kind']]}</b>", ""]
+    lines = [f"<b>{KIND[s['kind']]}</b>" + (" · ⏸ на паузе" if s["paused"] else ""), ""]
     kb = []
+    has_pending = any(i["status"] == "pending" for i in items)
     for it in items:
         if it["status"] == "pending":
             lines.append(f"▫️ {fmt(it['send_at'])} {label(it, s['kind'])}: {snip(it)}{flags(it)}")
@@ -319,7 +320,12 @@ async def v_set(sid: int):
             lines.append(f"▪️ {fmt(it['sent_at'])} {label(it, s['kind'])}: удалено")
         elif it["status"] == "failed":
             lines.append(f"❌ {label(it, s['kind'])}: не опубликовано")
-    kb = kb[:30]
+    kb = kb[:28]
+    if has_pending:
+        kb.insert(0, [Btn(text="▶️ Продолжить" if s["paused"] else "⏸ Пауза", callback_data=f"pz:{sid}")])
+        if not s["paused"]:
+            kb.insert(0, [Btn(text="⏩ Следующее сейчас", callback_data=f"nw:{sid}"),
+                          Btn(text="⏭ Пропустить", callback_data=f"sk:{sid}")])
     kb.append([Btn(text="⏹ Остановить", callback_data=f"stop:{sid}"), Btn(text="⏹🗑 Остановить и удалить из канала", callback_data=f"stopdel:{sid}")])
     kb.append([Btn(text="◀️ Назад", callback_data="list")])
     return "\n".join(lines[:60]), Kb(inline_keyboard=kb)
@@ -469,13 +475,13 @@ async def apply_plan(plan: dict, items: list[dict]) -> None:
             await db.upd_item(it["id"], delete_at=delete_at)
 
 
-async def replan(sid: int) -> None:
+async def replan(sid: int, delay: int = 0) -> None:
     s = await db.get_set(sid)
-    if not s or s["status"] != "scheduled":
+    if not s or s["status"] != "scheduled" or s["paused"]:
         return
     items = [i for i in await db.items_of(sid) if i["status"] != "failed"]
     if s["kind"] == "mutual":
-        plan = planner.plan_mutual(items, s["start_at"] or now(), await gap(), now())
+        plan = planner.plan_mutual(items, s["start_at"] or now(), await gap(), now() + timedelta(seconds=delay))
     elif s["kind"] == "night":
         send = {i["id"]: (i["sent_at"] if i["status"] in ("sent", "deleted") else i["send_at"]) for i in items
                 if i["send_at"] or i["sent_at"]}
@@ -583,13 +589,15 @@ async def tick(bot: Bot) -> None:
             try:
                 ids, via = await publish(bot, ch, it)
                 await db.mark_sent(it["id"], ids, via)
+                s_ = await db.get_set(it["set_id"])
+                if s_ and s_["kind"] == "mutual":
+                    await replan(it["set_id"])
             except Exception as e:
                 await db.upd_item(it["id"], status="failed")
                 await notify(bot, f"❌ Не удалось опубликовать «{html.escape(plain(it['text_html'])[:30])}»: {html.escape(str(e))}\n"
                                   "Проверь, что бот админ канала с правом публиковать сообщения.")
     for sid in await db.unfinished_sets():
-        await db.upd_set(sid, status="done")
-        await notify(bot, "✅ Набор полностью отработан.")
+        await db.upd_set(sid, status="done")  # без сообщения: оно поднимало чат с ботом выше канала
 
 
 async def worker(bot: Bot) -> None:
@@ -897,6 +905,50 @@ async def on_cb(c: CallbackQuery, bot: Bot):
         else:
             await open_view(bot, ("set", int(parts[0])))
         await c.answer()
+        return
+    if action in ("nw", "sk", "pz"):
+        sid = int(parts[0])
+        s = await db.get_set(sid)
+        if not s or s["status"] != "scheduled":
+            await c.answer("Набор уже завершён", show_alert=True)
+            return
+        pend = [i for i in await db.items_of(sid) if i["status"] == "pending"]
+        if action == "pz":
+            if s["paused"]:
+                g = await gap()
+                n = now()
+                if s["kind"] == "mutual":
+                    await db.upd_set(sid, paused=False)
+                    await replan(sid, delay=g)
+                else:  # ночь: просроченные шаги выходят по очереди, остальные по плану
+                    cur = n + timedelta(seconds=g)
+                    for i in pend:
+                        if i["send_at"] and i["send_at"] < cur:
+                            await db.upd_item(i["id"], send_at=cur)
+                            cur += timedelta(seconds=g)
+                    await db.upd_set(sid, paused=False)
+                    await replan(sid)
+                await c.answer("Продолжаю")
+            else:
+                await db.upd_set(sid, paused=True)
+                for i in await db.items_of(sid):  # на паузе ничего не удаляется
+                    if i["status"] == "sent" and i["delete_at"]:
+                        await db.upd_item(i["id"], delete_at=None)
+                await c.answer("Пауза")
+        elif not pend:
+            await c.answer("Больше нечего публиковать", show_alert=True)
+            return
+        elif action == "nw":
+            if s["paused"]:
+                await c.answer("Сначала сними паузу", show_alert=True)
+                return
+            await db.upd_item(pend[0]["id"], send_at=now())
+            await c.answer("Публикую")
+        else:
+            await db.del_item(pend[0]["id"])
+            await replan(sid)
+            await c.answer("Шаг пропущен")
+        await open_view(bot, ("set", sid))
         return
     if action in ("stop", "stopdel"):
         sid = int(parts[0])
