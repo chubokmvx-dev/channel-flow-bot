@@ -672,9 +672,33 @@ async def notify(bot: Bot, text: str) -> None:
         logging.exception("notify failed")
 
 
+async def with_tracking(it: dict) -> dict:
+    """Кнопки-приглашения заменяем на уникальные ссылки этого сообщения, чтобы считать вступления."""
+    btns = get_btns(it)
+    if not btns or not userbot.enabled():
+        return it
+    track, out = [], []
+    for b in btns:
+        t = None
+        try:
+            t = await userbot.track_link(b["url"], f"бот {it['id']} {now().strftime('%d.%m %H:%M')}")
+        except Exception as e:
+            logging.warning("track_link failed: %s", e)
+        if t:
+            track.append({"link": t["link"], "chat": t["chat"], "orig": b["url"]})
+            out.append({**b, "url": t["link"]})
+        else:
+            out.append(b)
+    if not track:
+        return it
+    await db.upd_item(it["id"], track=json.dumps(track))
+    return {**it, "btns": json.dumps(out, ensure_ascii=False)}
+
+
 async def publish(bot: Bot, ch, it: dict) -> tuple[list[int], str]:
     """Публикует в канал. Если подключён userbot, то от имени аккаунта владельца (работают премиум-эмодзи)."""
-    if userbot.enabled() and (it["text_ts"] or it["media_ts"]):
+    it = await with_tracking(it)
+    if userbot.enabled() and (it["text_ts"] or it["media_ts"] or it.get("plain") is not None):
         try:
             ids = await userbot.send(ch, it["text_ts"], it["media_ts"], plain(it["text_html"]),
                                      it["media_url"] if it["media_type"] == "photo" else None, hidden_preview(it),
@@ -693,6 +717,7 @@ async def publish(bot: Bot, ch, it: dict) -> tuple[list[int], str]:
 
 
 _snap_fail: dict[tuple, int] = {}
+_last_sweep = [0.0]
 
 
 async def snapshot(ch, it: dict, kind: str) -> None:
@@ -700,9 +725,10 @@ async def snapshot(ch, it: dict, kind: str) -> None:
     if not (userbot.enabled() and ch and it.get("ch_msg_ids")) or _snap_fail.get(key, 0) >= 3:
         return
     try:
-        st = await userbot.stats(ch, int(str(it["ch_msg_ids"]).split(",")[0]))
+        track = json.loads(it["track"]) if it.get("track") else None
+        st = await userbot.stats(ch, int(str(it["ch_msg_ids"]).split(",")[0]), track)
         if st:
-            await db.save_snap(it["id"], kind, st["views"], st["forwards"], st["reactions"], st["replies"])
+            await db.save_snap(it["id"], kind, st["views"], st["forwards"], st["reactions"], st["replies"], st["joins"])
         else:  # пост уже удалён вручную: отмечаем, чтобы не опрашивать снова
             await db.save_snap(it["id"], kind, -1, 0, 0, 0)
     except Exception as e:
@@ -716,6 +742,9 @@ async def tick(bot: Bot) -> None:
     ch = await channel()
     for it in await db.due_deletions():
         await snapshot(ch, it, "final")  # цифры за минуту до удаления: потом поста уже не будет
+        if it.get("track") and userbot.enabled():
+            await userbot.revoke(json.loads(it["track"]))  # старые ссылки закрываем: у админа лимит активных приглашений
+            await db.upd_item(it["id"], track_done=True)
         try:
             if ch and it["ch_msg_ids"]:
                 ids = [int(x) for x in it["ch_msg_ids"].split(",")]
@@ -747,6 +776,11 @@ async def tick(bot: Bot) -> None:
     if userbot.enabled() and ch:
         for it in await db.due_snaps():
             await snapshot(ch, it, it["kind"])
+    if userbot.enabled() and time.time() - _last_sweep[0] > 600:
+        _last_sweep[0] = time.time()
+        for it in await db.stale_tracks():  # посты без таймера удаления: ссылки закрываем через 3 дня
+            await userbot.revoke(json.loads(it["track"]))
+            await db.upd_item(it["id"], track_done=True)
     for sid in await db.unfinished_sets():
         await schedule_repeat(bot, sid)  # сначала следующий повтор, потом закрываем этот: при сбое не потеряем серию
         await db.upd_set(sid, status="done")  # без сообщения: оно поднимало чат с ботом выше канала

@@ -4,8 +4,10 @@ import copy
 import json
 import logging
 import random
+import re
 
 from telethon import TelegramClient
+from telethon import utils
 from telethon.sessions import StringSession
 from telethon.tl import functions, types
 
@@ -150,7 +152,60 @@ async def delete(ch, ids: list[int]) -> None:
     await client.delete_messages(peer, ids)
 
 
-async def stats(ch, msg_id: int) -> dict | None:
+INV_RE = re.compile(r"t\.me/(?:\+|joinchat/)([\w-]+)")
+_hash_cache: dict = {}
+
+
+async def track_link(url: str, title: str) -> dict | None:
+    """Если ссылка-приглашение создана этим аккаунтом, делаем для поста отдельную копию с теми же настройками и считаем по ней вступления."""
+    m = INV_RE.search(url or "")
+    if not m:
+        return None
+    h = m.group(1)
+    if h not in _hash_cache:
+        info = False
+        try:
+            r = await client(functions.messages.CheckChatInviteRequest(h))
+            if isinstance(r, types.ChatInviteAlready):
+                peer = await client.get_input_entity(r.chat)
+                ex = await client(functions.messages.GetExportedChatInviteRequest(peer=peer, link=url))
+                inv = getattr(ex, "invite", ex)
+                info = (peer, bool(getattr(inv, "request_needed", False)), utils.get_peer_id(r.chat))
+        except Exception as e:
+            logging.info("track_link: ссылка не отслеживается (%s): %s", h, e)
+        _hash_cache[h] = info
+    info = _hash_cache[h]
+    if not info:
+        return None
+    peer, req, chat_id = info
+    inv = await client(functions.messages.ExportChatInviteRequest(peer=peer, request_needed=req, title=title[:32]))
+    return {"link": inv.link, "chat": chat_id}
+
+
+async def _invite(chat_id: int, link: str):
+    peer = await _chan(chat_id)
+    ex = await client(functions.messages.GetExportedChatInviteRequest(peer=peer, link=link))
+    return getattr(ex, "invite", ex)
+
+
+async def joins(track: list[dict]) -> int:
+    total = 0
+    for t in track:
+        inv = await _invite(t["chat"], t["link"])
+        total += (getattr(inv, "usage", 0) or 0) + (getattr(inv, "requested", 0) or 0)
+    return total
+
+
+async def revoke(track: list[dict]) -> None:
+    for t in track:
+        try:
+            peer = await _chan(t["chat"])
+            await client(functions.messages.EditExportedChatInviteRequest(peer=peer, link=t["link"], revoked=True))
+        except Exception as e:
+            logging.info("revoke failed: %s", e)
+
+
+async def stats(ch, msg_id: int, track: list[dict] | None = None) -> dict | None:
     """Просмотры, пересылки, реакции и ответы поста в канале."""
     peer = await _chan(ch)
     m = await client.get_messages(peer, ids=msg_id)
@@ -158,4 +213,10 @@ async def stats(ch, msg_id: int) -> dict | None:
         return None
     reactions = sum(r.count for r in (m.reactions.results if m.reactions and m.reactions.results else []))
     replies = m.replies.replies if m.replies else 0
-    return {"views": m.views or 0, "forwards": m.forwards or 0, "reactions": reactions, "replies": replies}
+    j = 0
+    if track:
+        try:
+            j = await joins(track)
+        except Exception as e:
+            logging.info("joins failed: %s", e)
+    return {"views": m.views or 0, "forwards": m.forwards or 0, "reactions": reactions, "replies": replies, "joins": j}
