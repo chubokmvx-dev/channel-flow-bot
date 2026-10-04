@@ -25,6 +25,7 @@ from aiogram.types import (
 import config
 import db
 import planner
+import userbot
 
 logging.basicConfig(level=logging.INFO)
 TZ = ZoneInfo(config.TIMEZONE)
@@ -138,7 +139,9 @@ def extract(m: Message) -> dict | None:
     elif not m.text:
         return None
     return {"text_html": (m.html_text or "") if (m.text or m.caption) else "", "media_type": media_type, "file_id": file_id,
-            "src_chat": m.chat.id, "src_msg": m.message_id}
+            "src_chat": m.chat.id, "src_msg": m.message_id,
+            "text_msg": m.message_id if (m.text or m.caption) else None,
+            "media_msg": m.message_id if media_type else None}
 
 
 def markup(it: dict) -> Kb | None:
@@ -385,7 +388,8 @@ async def v_settings():
     lo, hi = await start_range()
     title = await db.get_setting("channel_title") or "не выбран"
     text = (f"<b>Настройки</b>\n\n📣 Канал: {html.escape(title)}\n⏱ Пауза между шагами: {g // 60} мин\n"
-            f"⏳ Старт после запуска: {lo // 60}–{hi // 60} мин\n🕐 Часовой пояс: {config.TIMEZONE}")
+            f"⏳ Старт после запуска: {lo // 60}–{hi // 60} мин\n🕐 Часовой пояс: {config.TIMEZONE}\n"
+            f"👤 Публикация от твоего аккаунта (премиум-эмодзи): {'включена' if userbot.enabled() else 'выключена'}")
     kb = Kb(inline_keyboard=[
         [Btn(text="📣 Выбрать канал", callback_data="cfg:channel")],
         [Btn(text=("✓ " if g == v else "") + f"{v // 60} мин", callback_data=f"cfg:gap:{v}") for v in (60, 120, 180, 300)],
@@ -534,23 +538,48 @@ async def notify(bot: Bot, text: str) -> None:
         logging.exception("notify failed")
 
 
+async def publish(bot: Bot, ch, it: dict) -> tuple[list[int], str]:
+    """Публикует в канал. Если подключён userbot, то от имени аккаунта владельца (работают премиум-эмодзи)."""
+    if userbot.enabled() and (it["text_msg"] or it["media_msg"]):
+        try:
+            ids = await userbot.send(ch, it["text_msg"], it["media_msg"])
+            if it["btn_url"]:
+                try:  # кнопки-ссылки может добавить только бот; ему нужно право «Редактирование сообщений»
+                    await bot.edit_message_reply_markup(chat_id=ch, message_id=ids[-1], reply_markup=markup(it))
+                except Exception as e:
+                    await notify(bot, f"⚠️ Пост вышел, но кнопку добавить не удалось: {html.escape(str(e))}\n"
+                                      "Включи боту в канале право «Редактирование сообщений».")
+            return ids, "user"
+        except Exception as e:
+            logging.warning("userbot send failed, fallback to bot: %s", e)
+            await notify(bot, f"⚠️ Не вышло опубликовать от твоего аккаунта ({html.escape(str(e))}). Публикую через бота, премиум-эмодзи могут не сохраниться.")
+    return await send_item(bot, ch, it), "bot"
+
+
 async def tick(bot: Bot) -> None:
     ch = await channel()
     for it in await db.due_deletions():
         try:
             if ch and it["ch_msg_ids"]:
-                for mid in it["ch_msg_ids"].split(","):
+                ids = [int(x) for x in it["ch_msg_ids"].split(",")]
+                if it.get("via") == "user" and userbot.enabled():
                     try:
-                        await bot.delete_message(ch, int(mid))
+                        await userbot.delete(ch, ids)
                     except Exception as e:
-                        logging.warning("delete failed: %s", e)
+                        logging.warning("userbot delete failed: %s", e)
+                else:
+                    for mid in ids:
+                        try:
+                            await bot.delete_message(ch, mid)
+                        except Exception as e:
+                            logging.warning("delete failed: %s", e)
         finally:
             await db.upd_item(it["id"], status="deleted", delete_at=None)
     if ch:
         for it in await db.due_sends():
             try:
-                ids = await send_item(bot, ch, it)
-                await db.mark_sent(it["id"], ids)
+                ids, via = await publish(bot, ch, it)
+                await db.mark_sent(it["id"], ids, via)
             except Exception as e:
                 await db.upd_item(it["id"], status="failed")
                 await notify(bot, f"❌ Не удалось опубликовать «{html.escape(plain(it['text_html'])[:30])}»: {html.escape(str(e))}\n"
@@ -692,7 +721,8 @@ async def on_message(m: Message, bot: Bot):
             if not data["media_type"]:
                 await tmp(bot, "Нужно фото, видео, гиф или файл.")
                 return
-            await db.upd_item(cur[1], media_type=data["media_type"], file_id=data["file_id"], src_chat=None, src_msg=None)
+            await db.upd_item(cur[1], media_type=data["media_type"], file_id=data["file_id"],
+                              media_msg=data["media_msg"], src_msg=None)
             await after_item_change(bot, cur[1], fresh=True)
         elif cur[0] == "repl":
             await db.upd_item(cur[1], **data)
@@ -704,7 +734,7 @@ async def on_message(m: Message, bot: Bot):
                 await db.upd_item(cur[1], **data)
             else:
                 # у поста есть медиа: меняем только текст, медиа остаётся
-                await db.upd_item(cur[1], text_html=data["text_html"], src_chat=None, src_msg=None)
+                await db.upd_item(cur[1], text_html=data["text_html"], text_msg=data["text_msg"], src_msg=None)
             await after_item_change(bot, cur[1], fresh=True)
         else:
             it = await db.get_item(cur[1])
@@ -902,7 +932,7 @@ async def on_cb(c: CallbackQuery, bot: Bot):
             mode = ("txt", iid)
             await tmp(bot, "Отправь новый текст (форматирование и эмодзи сохранятся). Медиа останется на месте.", cancel_kb)
         elif action == "mx":
-            await db.upd_item(iid, media_type=None, file_id=None, src_chat=None, src_msg=None)
+            await db.upd_item(iid, media_type=None, file_id=None, media_msg=None, src_msg=None)
             await after_item_change(bot, iid)
         elif action == "bt":
             await clear_tmp(bot)
@@ -956,6 +986,7 @@ async def main() -> None:
     bot = Bot(config.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
     dp.include_router(router)
+    await userbot.start((await bot.get_me()).username)
     asyncio.create_task(worker(bot))
     await bot.delete_webhook(drop_pending_updates=False)
     await dp.start_polling(bot)
