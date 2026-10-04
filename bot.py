@@ -267,8 +267,8 @@ async def v_draft(sid: int):
         rows.append([Btn(text=("✓ " if s["next_role"] == r else "") + ROLE[r], callback_data=f"nr:{sid}:{r}") for r in ROLES])
     if items:
         last = items[-1]["id"]
-        rows.append([Btn(text="📎 Медиа", callback_data=f"md:{last}"), Btn(text="🔗 Кнопка", callback_data=f"bt:{last}"),
-                     Btn(text="🗑 Таймер", callback_data=f"tm:{last}")])
+        rows.append([Btn(text="✏️ Текст", callback_data=f"tx:{last}"), Btn(text="📎 Медиа", callback_data=f"md:{last}"),
+                     Btn(text="🔗 Кнопка", callback_data=f"bt:{last}"), Btn(text="🗑 Таймер", callback_data=f"tm:{last}")])
         extra = [Btn(text="👁 Предпросмотр", callback_data=f"pv:{last}")]
         if s["kind"] != "single":
             extra.insert(0, Btn(text="↩️ Убрать последнее", callback_data=f"rl:{sid}"))
@@ -340,8 +340,9 @@ async def v_item(iid: int):
     lines.append("Удаление: " + (f"{fmt(it['delete_at'], True)}" + (" (по таймеру)" if ttl else "") if it["delete_at"] else "не удаляется"))
     rows = []
     if it["status"] == "pending":
-        rows.append([Btn(text="✏️ Заменить", callback_data=f"rp:{iid}"), Btn(text="📎 Медиа", callback_data=f"md:{iid}")])
+        rows.append([Btn(text="✏️ Текст", callback_data=f"tx:{iid}"), Btn(text="📎 Медиа", callback_data=f"md:{iid}")])
         rows.append([Btn(text="🔗 Кнопка", callback_data=f"bt:{iid}"), Btn(text="🗑 Таймер", callback_data=f"tm:{iid}")])
+        rows.append([Btn(text="🔁 Заменить всё сообщение", callback_data=f"rp:{iid}")])
         if s["kind"] == "mutual":
             rows.append([Btn(text="⬆️ Выше", callback_data=f"up:{iid}"), Btn(text="⬇️ Ниже", callback_data=f"dn:{iid}")])
             rows.append([Btn(text="➕ Вставить после:", callback_data="noop")])
@@ -682,7 +683,7 @@ async def on_message(m: Message, bot: Bot):
         await after_item_change(bot, cur[1], fresh=True)
         return
 
-    if cur and cur[0] in ("media", "repl", "ins"):
+    if cur and cur[0] in ("media", "repl", "ins", "txt"):
         data = extract(m)
         if data is None:
             await tmp(bot, "Этот тип сообщения не поддерживается. Отправь текст, фото, видео, гиф или файл.")
@@ -695,6 +696,15 @@ async def on_message(m: Message, bot: Bot):
             await after_item_change(bot, cur[1], fresh=True)
         elif cur[0] == "repl":
             await db.upd_item(cur[1], **data)
+            await after_item_change(bot, cur[1], fresh=True)
+        elif cur[0] == "txt":
+            it = await db.get_item(cur[1])
+            if data["media_type"] or not (it and it["media_type"]):
+                # прислали фото с подписью или у поста нет медиа: берём сообщение целиком
+                await db.upd_item(cur[1], **data)
+            else:
+                # у поста есть медиа: меняем только текст, медиа остаётся
+                await db.upd_item(cur[1], text_html=data["text_html"], src_chat=None, src_msg=None)
             await after_item_change(bot, cur[1], fresh=True)
         else:
             it = await db.get_item(cur[1])
@@ -873,7 +883,7 @@ async def on_cb(c: CallbackQuery, bot: Bot):
         return
 
     # дальше действия над конкретным элементом
-    if action in ("md", "bt", "tm", "pv", "rp", "rm", "up", "dn", "in", "dl", "tt", "mx"):
+    if action in ("md", "tx", "bt", "tm", "pv", "rp", "rm", "up", "dn", "in", "dl", "tt", "mx"):
         iid = int(parts[0])
         it = await db.get_item(iid)
         if not it:
@@ -887,6 +897,10 @@ async def on_cb(c: CallbackQuery, bot: Bot):
             if it["media_type"]:
                 rows.insert(0, [Btn(text="🗑 Убрать медиа", callback_data=f"mx:{iid}")])
             await tmp(bot, "Отправь фото, видео, гиф или файл.", Kb(inline_keyboard=rows))
+        elif action == "tx":
+            await clear_tmp(bot)
+            mode = ("txt", iid)
+            await tmp(bot, "Отправь новый текст (форматирование и эмодзи сохранятся). Медиа останется на месте.", cancel_kb)
         elif action == "mx":
             await db.upd_item(iid, media_type=None, file_id=None, src_chat=None, src_msg=None)
             await after_item_change(bot, iid)
