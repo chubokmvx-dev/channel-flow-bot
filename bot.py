@@ -659,7 +659,7 @@ async def on_message(m: Message, bot: Bot):
             await tmp(bot, "Не понял время. Примеры: 21:30 или 05.10 08:00")
             return
         await db.upd_set(cur[1], start_at=when)
-        await finish_set_time(bot, cur[1])
+        await finish_set_time(bot, cur[1], fresh=True)
         return
 
     if cur and cur[0] == "btn":
@@ -671,7 +671,7 @@ async def on_message(m: Message, bot: Bot):
         else:
             await tmp(bot, "Формат: Текст кнопки - https://ссылка (или слово «убрать»).")
             return
-        await after_item_change(bot, cur[1])
+        await after_item_change(bot, cur[1], fresh=True)
         return
 
     if cur and cur[0] in ("media", "repl", "ins"):
@@ -684,17 +684,17 @@ async def on_message(m: Message, bot: Bot):
                 await tmp(bot, "Нужно фото, видео, гиф или файл.")
                 return
             await db.upd_item(cur[1], media_type=data["media_type"], file_id=data["file_id"])
-            await after_item_change(bot, cur[1])
+            await after_item_change(bot, cur[1], fresh=True)
         elif cur[0] == "repl":
             await db.upd_item(cur[1], **data)
-            await after_item_change(bot, cur[1])
+            await after_item_change(bot, cur[1], fresh=True)
         else:
             it = await db.get_item(cur[1])
             s = await db.get_set(it["set_id"])
             await add_to_draft(bot, s, data, after_id=cur[1], role=cur[2])
             mode = None
             await clear_tmp(bot)
-            await render(bot)
+            await render(bot, fresh=True)
         return
 
     # обычное сообщение: добавляем в открытый черновик
@@ -704,14 +704,14 @@ async def on_message(m: Message, bot: Bot):
         if s and data:
             await clear_tmp(bot)
             await add_to_draft(bot, s, data)
-            await render(bot)
+            await render(bot, fresh=True)   # панель всегда под последним сообщением
             return
         await tmp(bot, "Этот тип сообщения не поддерживается. Отправь текст, фото, видео, гиф или файл.")
         return
     await tmp(bot, "Нажми «Создать пост» внизу, чтобы начать.")
 
 
-async def after_item_change(bot: Bot, item_id: int) -> None:
+async def after_item_change(bot: Bot, item_id: int, fresh: bool = False) -> None:
     global mode
     mode = None
     await clear_tmp(bot)
@@ -720,14 +720,14 @@ async def after_item_change(bot: Bot, item_id: int) -> None:
         s = await db.get_set(it["set_id"])
         if s and s["status"] == "scheduled":
             await replan(s["id"])
-    await render(bot)
+    await render(bot, fresh)
 
 
-async def finish_set_time(bot: Bot, sid: int) -> None:
+async def finish_set_time(bot: Bot, sid: int, fresh: bool = False) -> None:
     global mode
     mode = None
     await clear_tmp(bot)
-    await render(bot)
+    await render(bot, fresh)
 
 
 # ---------- кнопки ----------
