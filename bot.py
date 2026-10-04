@@ -141,7 +141,10 @@ def extract(m: Message) -> dict | None:
     return {"text_html": (m.html_text or "") if (m.text or m.caption) else "", "media_type": media_type, "file_id": file_id,
             "src_chat": m.chat.id, "src_msg": m.message_id,
             "text_msg": m.message_id if (m.text or m.caption) else None,
-            "media_msg": m.message_id if media_type else None}
+            "media_msg": m.message_id if media_type else None,
+            # ID сообщений в личке у бота и у пользователя разные, поэтому для userbot ищем по времени отправки
+            "text_ts": int(m.date.timestamp()) if (m.text or m.caption) else None,
+            "media_ts": int(m.date.timestamp()) if media_type else None}
 
 
 def markup(it: dict) -> Kb | None:
@@ -540,9 +543,9 @@ async def notify(bot: Bot, text: str) -> None:
 
 async def publish(bot: Bot, ch, it: dict) -> tuple[list[int], str]:
     """Публикует в канал. Если подключён userbot, то от имени аккаунта владельца (работают премиум-эмодзи)."""
-    if userbot.enabled() and (it["text_msg"] or it["media_msg"]):
+    if userbot.enabled() and (it["text_ts"] or it["media_ts"]):
         try:
-            ids = await userbot.send(ch, it["text_msg"], it["media_msg"])
+            ids = await userbot.send(ch, it["text_ts"], it["media_ts"], plain(it["text_html"]))
             if it["btn_url"]:
                 try:  # кнопки-ссылки может добавить только бот; ему нужно право «Редактирование сообщений»
                     await bot.edit_message_reply_markup(chat_id=ch, message_id=ids[-1], reply_markup=markup(it))
@@ -722,7 +725,7 @@ async def on_message(m: Message, bot: Bot):
                 await tmp(bot, "Нужно фото, видео, гиф или файл.")
                 return
             await db.upd_item(cur[1], media_type=data["media_type"], file_id=data["file_id"],
-                              media_msg=data["media_msg"], src_msg=None)
+                              media_msg=data["media_msg"], media_ts=data["media_ts"], src_msg=None)
             await after_item_change(bot, cur[1], fresh=True)
         elif cur[0] == "repl":
             await db.upd_item(cur[1], **data)
@@ -734,7 +737,7 @@ async def on_message(m: Message, bot: Bot):
                 await db.upd_item(cur[1], **data)
             else:
                 # у поста есть медиа: меняем только текст, медиа остаётся
-                await db.upd_item(cur[1], text_html=data["text_html"], text_msg=data["text_msg"], src_msg=None)
+                await db.upd_item(cur[1], text_html=data["text_html"], text_msg=data["text_msg"], text_ts=data["text_ts"], src_msg=None)
             await after_item_change(bot, cur[1], fresh=True)
         else:
             it = await db.get_item(cur[1])
@@ -932,7 +935,7 @@ async def on_cb(c: CallbackQuery, bot: Bot):
             mode = ("txt", iid)
             await tmp(bot, "Отправь новый текст (форматирование и эмодзи сохранятся). Медиа останется на месте.", cancel_kb)
         elif action == "mx":
-            await db.upd_item(iid, media_type=None, file_id=None, media_msg=None, src_msg=None)
+            await db.upd_item(iid, media_type=None, file_id=None, media_msg=None, media_ts=None, src_msg=None)
             await after_item_change(bot, iid)
         elif action == "bt":
             await clear_tmp(bot)

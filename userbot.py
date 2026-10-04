@@ -41,15 +41,34 @@ async def _chan(ch):
         return await client.get_input_entity(ch)
 
 
-async def send(ch, text_msg: int | None, media_msg: int | None) -> list[int]:
+async def _find(ts: int, text: str | None = None, want_media: bool = False):
+    """Ищет своё сообщение в чате с ботом по времени отправки (±1 с), при необходимости по тексту и наличию медиа."""
+    cands = []
+    async for m in client.iter_messages(_bot_peer, limit=400):
+        t = int(m.date.timestamp())
+        if t < ts - 5:
+            break
+        if not m.out or abs(t - ts) > 1:
+            continue
+        if want_media and not m.media:
+            continue
+        cands.append(m)
+    if text is not None:
+        exact = [m for m in cands if (m.message or "").strip() == text.strip()]
+        if exact:
+            return exact[0]
+    return cands[0] if cands else None
+
+
+async def send(ch, text_ts: int | None, media_ts: int | None, text_plain: str = "") -> list[int]:
     peer = await _chan(ch)
-    ids = [i for i in {text_msg, media_msg} if i]
-    msgs = await client.get_messages(_bot_peer, ids=ids)
-    by_id = {m.id: m for m in msgs if m}
-    tm = by_id.get(text_msg) if text_msg else None
-    mm = by_id.get(media_msg) if media_msg else None
-    if (text_msg and not tm) or (media_msg and not mm):
-        raise RuntimeError("исходное сообщение в чате с ботом не найдено (удалено?)")
+    tm = await _find(text_ts, text_plain) if text_ts else None
+    if media_ts:
+        mm = tm if (tm is not None and media_ts == text_ts and tm.media) else await _find(media_ts, None, True)
+    else:
+        mm = None
+    if (text_ts and not tm) or (media_ts and not mm):
+        raise RuntimeError("исходное сообщение в чате с ботом не найдено (удалено или слишком старое?)")
     text = (tm.message if tm else "") or ""
     ents = (tm.entities if tm else None) or None
     if mm:

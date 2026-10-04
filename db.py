@@ -47,6 +47,8 @@ async def init(dsn: str) -> None:
     await pool.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS text_msg BIGINT")
     await pool.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS media_msg BIGINT")
     await pool.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS via TEXT")
+    await pool.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS text_ts BIGINT")
+    await pool.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS media_ts BIGINT")
     await pool.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
 
 
@@ -118,9 +120,10 @@ async def add_item(set_id: int, role: str, part: int, fields: dict, status: str,
         pos = (await pool.fetchval("SELECT coalesce(max(pos),0) FROM items WHERE set_id=$1", set_id)) + 1
     return await pool.fetchval(
         "INSERT INTO items (set_id, role, part, pos, text_html, media_type, file_id, status, src_chat, src_msg, "
-        "text_msg, media_msg) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id",
+        "text_msg, media_msg, text_ts, media_ts) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING id",
         set_id, role, part, pos, fields.get("text_html", ""), fields.get("media_type"), fields.get("file_id"), status,
         fields.get("src_chat"), fields.get("src_msg"), fields.get("text_msg"), fields.get("media_msg"),
+        fields.get("text_ts"), fields.get("media_ts"),
     )
 
 
