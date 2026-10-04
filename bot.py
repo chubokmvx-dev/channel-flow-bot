@@ -1048,7 +1048,15 @@ async def on_cb(c: CallbackQuery, bot: Bot):
                 await db.upd_item(iid, delete_at=None)
             await after_item_change(bot, iid)
         elif action == "pv":
-            m = await send_item(bot, ADMIN, it)
+            try:  # превью без пересборки: копируем исходные сообщения, эмодзи и форматирование остаются как есть
+                if it["media_msg"] and it["text_msg"] and it["text_msg"] != it["media_msg"]:
+                    a = await bot.copy_message(ADMIN, ADMIN, it["media_msg"])
+                    b = await bot.copy_message(ADMIN, ADMIN, it["text_msg"], reply_markup=markup(it))
+                    m = [a.message_id, b.message_id]
+                else:
+                    m = await send_item(bot, ADMIN, it)
+            except Exception:
+                m = await send_item(bot, ADMIN, it)
             tmp_ids.extend(m)
             await tmp(bot, "Так выглядит пост.", Kb(inline_keyboard=[[Btn(text="✖️ Закрыть", callback_data="cancel")]]))
         elif action == "rm":
