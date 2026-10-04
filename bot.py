@@ -2,6 +2,7 @@ import asyncio
 import html
 import logging
 import random
+import re
 import time
 from zoneinfo import ZoneInfo
 from datetime import datetime
@@ -33,6 +34,9 @@ TTL = {120: "2 хв", 600: "10 хв", 3600: "1 год", 86400: "24 год", 0: "
 
 # режим очікування наступного повідомлення: ("edit", id) | ("btn", id) | ("ins", id, kind) | ("channel",)
 mode: tuple | None = None
+
+# «Текст - https://…» (також приймаємо | та довге тире)
+BTN_RE = re.compile(r"^(.+?)\s*(?:\s[-–—]\s|\|)\s*((?:https?|tg)://\S+)$", re.S)
 
 
 # ---------- налаштування ----------
@@ -376,13 +380,12 @@ async def on_message(m: Message):
         if t.lower() in ("прибрати", "-", "видалити"):
             await db.update(cur[1], btn_text=None, btn_url=None)
             await m.answer("Кнопку прибрано.")
-        elif "|" in t and t.split("|", 1)[1].strip().startswith(("http://", "https://", "tg://")):
-            a, b = t.split("|", 1)
-            await db.update(cur[1], btn_text=a.strip()[:60], btn_url=b.strip())
+        elif (mt := BTN_RE.match(t)):
+            await db.update(cur[1], btn_text=mt.group(1).strip()[:60], btn_url=mt.group(2))
             await m.answer("🔗 Кнопку додано.")
         else:
             mode = cur
-            await m.answer("Формат: Текст кнопки | https://посилання (або «прибрати»).")
+            await m.answer("Формат: Текст кнопки - https://посилання (або «прибрати»).")
             return
         if it:
             await show_item(m.chat.id, m.bot, cur[1])
@@ -459,7 +462,7 @@ async def on_cb(c: CallbackQuery):
         await bot.send_message(chat_id, "Надішли нове повідомлення, воно замінить це.")
     elif kind == "b":
         mode = ("btn", item_id)
-        await bot.send_message(chat_id, "Надішли: <code>Текст кнопки | https://посилання</code>\nАбо «прибрати».")
+        await bot.send_message(chat_id, "Надішли: <code>Текст кнопки - https://посилання</code>\nАбо «прибрати».")
     elif kind == "t":
         await bot.send_message(chat_id, "Через скільки після публікації видалити з каналу?", reply_markup=Kb(inline_keyboard=[
             [Btn(text=v, callback_data=f"ts:{item_id}:{k_}") for k_, v in list(TTL.items())[:3]],
