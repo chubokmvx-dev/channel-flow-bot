@@ -8,20 +8,37 @@ async def init(dsn: str) -> None:
     pool = await asyncpg.create_pool(dsn)
     await pool.execute(
         """
+        CREATE TABLE IF NOT EXISTS sets (
+            id         SERIAL PRIMARY KEY,
+            kind       TEXT NOT NULL,                      -- single | mutual | night
+            status     TEXT NOT NULL DEFAULT 'draft',      -- draft | scheduled | done | cancelled
+            start_at   TIMESTAMPTZ,
+            p2_at      TIMESTAMPTZ,
+            end_at     TIMESTAMPTZ,
+            next_role  TEXT NOT NULL DEFAULT 'warmup',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        """
+    )
+    await pool.execute(
+        """
         CREATE TABLE IF NOT EXISTS items (
-            id           SERIAL PRIMARY KEY,
-            pos          DOUBLE PRECISION NOT NULL,
-            kind         TEXT NOT NULL,                 -- warmup | post | reminder
-            src_chat     BIGINT NOT NULL,
-            src_msg      BIGINT NOT NULL,
-            preview      TEXT NOT NULL DEFAULT '',
-            btn_text     TEXT,
-            btn_url      TEXT,
-            delete_after INT NOT NULL DEFAULT 0,        -- секунд після публікації, 0 = не видаляти
-            status       TEXT NOT NULL DEFAULT 'pending', -- pending | sent | failed | deleted
-            sent_at      TIMESTAMPTZ,
-            ch_msg_id    BIGINT,
-            delete_at    TIMESTAMPTZ
+            id         SERIAL PRIMARY KEY,
+            set_id     INT NOT NULL REFERENCES sets(id) ON DELETE CASCADE,
+            role       TEXT NOT NULL,                      -- warmup | post | reminder
+            part       INT NOT NULL DEFAULT 1,             -- для ночи: 1 или 2
+            pos        DOUBLE PRECISION NOT NULL,
+            text_html  TEXT NOT NULL DEFAULT '',
+            media_type TEXT,                               -- photo | video | animation | document
+            file_id    TEXT,
+            btn_text   TEXT,
+            btn_url    TEXT,
+            custom_ttl INT,                                -- NULL авто, 0 не удалять, >0 секунд после публикации
+            send_at    TIMESTAMPTZ,
+            delete_at  TIMESTAMPTZ,
+            status     TEXT NOT NULL DEFAULT 'draft',      -- draft | pending | sent | deleted | failed
+            ch_msg_ids TEXT,
+            sent_at    TIMESTAMPTZ
         )
         """
     )
@@ -33,84 +50,148 @@ async def get_setting(key: str, default: str | None = None) -> str | None:
     return default if v is None else v
 
 
-async def set_setting(key: str, value: str) -> None:
+async def set_setting(key: str, value) -> None:
     await pool.execute(
         "INSERT INTO settings (key, value) VALUES ($1,$2) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
         key, str(value),
     )
 
 
-async def add(kind, src_chat, src_msg, preview, delete_after, after_id=None) -> int:
-    if after_id:
-        cur = await pool.fetchval("SELECT pos FROM items WHERE id=$1", after_id)
-        nxt = await pool.fetchval("SELECT min(pos) FROM items WHERE status='pending' AND pos>$1", cur)
-        pos = cur + 1 if nxt is None else (cur + nxt) / 2
-    else:
-        pos = (await pool.fetchval("SELECT coalesce(max(pos),0) FROM items")) + 1
-    return await pool.fetchval(
-        "INSERT INTO items (pos, kind, src_chat, src_msg, preview, delete_after) "
-        "VALUES ($1,$2,$3,$4,$5,$6) RETURNING id",
-        pos, kind, src_chat, src_msg, preview, delete_after,
+async def _upd(table: str, row_id: int, fields: dict) -> None:
+    keys = list(fields)
+    sets = ", ".join(f"{k}=${i + 2}" for i, k in enumerate(keys))
+    await pool.execute(f"UPDATE {table} SET {sets} WHERE id=$1", row_id, *[fields[k] for k in keys])
+
+
+# ---------- наборы ----------
+
+async def new_set(kind: str) -> int:
+    nxt = "post" if kind == "single" else "warmup"
+    return await pool.fetchval("INSERT INTO sets (kind, next_role) VALUES ($1,$2) RETURNING id", kind, nxt)
+
+
+async def get_set(set_id: int) -> dict | None:
+    r = await pool.fetchrow("SELECT * FROM sets WHERE id=$1", set_id)
+    return dict(r) if r else None
+
+
+async def upd_set(set_id: int, **f) -> None:
+    await _upd("sets", set_id, f)
+
+
+async def delete_set(set_id: int) -> None:
+    await pool.execute("DELETE FROM sets WHERE id=$1", set_id)
+
+
+async def active_sets() -> list[dict]:
+    rows = await pool.fetch(
+        """
+        SELECT s.*, (SELECT count(*) FROM items i WHERE i.set_id=s.id) AS n,
+               (SELECT min(send_at) FROM items i WHERE i.set_id=s.id AND i.status='pending') AS next_at
+        FROM sets s WHERE s.status IN ('draft','scheduled') ORDER BY s.id
+        """
+    )
+    return [dict(r) for r in rows]
+
+
+async def drop_empty_drafts(except_id: int | None = None) -> None:
+    await pool.execute(
+        "DELETE FROM sets s WHERE s.status='draft' AND s.id IS DISTINCT FROM $1::int "
+        "AND NOT EXISTS (SELECT 1 FROM items i WHERE i.set_id=s.id)",
+        except_id,
     )
 
 
-async def get(item_id: int) -> dict | None:
+# ---------- элементы ----------
+
+async def add_item(set_id: int, role: str, part: int, fields: dict, status: str, after_id: int | None = None) -> int:
+    if after_id:
+        cur = await pool.fetchval("SELECT pos FROM items WHERE id=$1", after_id)
+        nxt = await pool.fetchval("SELECT min(pos) FROM items WHERE set_id=$1 AND pos>$2", set_id, cur)
+        pos = cur + 1 if nxt is None else (cur + nxt) / 2
+    else:
+        pos = (await pool.fetchval("SELECT coalesce(max(pos),0) FROM items WHERE set_id=$1", set_id)) + 1
+    return await pool.fetchval(
+        "INSERT INTO items (set_id, role, part, pos, text_html, media_type, file_id, status) "
+        "VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id",
+        set_id, role, part, pos, fields.get("text_html", ""), fields.get("media_type"), fields.get("file_id"), status,
+    )
+
+
+async def items_of(set_id: int) -> list[dict]:
+    rows = await pool.fetch("SELECT * FROM items WHERE set_id=$1 ORDER BY pos", set_id)
+    return [dict(r) for r in rows]
+
+
+async def get_item(item_id: int) -> dict | None:
     r = await pool.fetchrow("SELECT * FROM items WHERE id=$1", item_id)
     return dict(r) if r else None
 
 
-async def pending() -> list[dict]:
-    return [dict(r) for r in await pool.fetch("SELECT * FROM items WHERE status='pending' ORDER BY pos")]
+async def upd_item(item_id: int, **f) -> None:
+    await _upd("items", item_id, f)
 
 
-async def recent_sent(limit: int = 5) -> list[dict]:
-    rows = await pool.fetch("SELECT * FROM items WHERE sent_at IS NOT NULL ORDER BY sent_at DESC LIMIT $1", limit)
-    return [dict(r) for r in rows]
-
-
-async def tail_kinds(n: int = 2) -> list[str]:
-    rows = await pool.fetch("SELECT kind FROM items WHERE status='pending' ORDER BY pos DESC LIMIT $1", n)
-    return [r["kind"] for r in rows]
-
-
-async def update(item_id: int, **fields) -> None:
-    keys = list(fields)
-    sets = ", ".join(f"{k}=${i + 2}" for i, k in enumerate(keys))
-    await pool.execute(f"UPDATE items SET {sets} WHERE id=$1", item_id, *[fields[k] for k in keys])
-
-
-async def remove(item_id: int) -> None:
-    await pool.execute("DELETE FROM items WHERE id=$1 AND status='pending'", item_id)
-
-
-async def clear_pending() -> None:
-    await pool.execute("DELETE FROM items WHERE status='pending'")
+async def del_item(item_id: int) -> None:
+    await pool.execute("DELETE FROM items WHERE id=$1 AND status IN ('draft','pending')", item_id)
 
 
 async def move(item_id: int, direction: int) -> bool:
-    """direction -1 вгору, +1 вниз (серед pending)."""
-    items = await pending()
-    ids = [i["id"] for i in items]
+    it = await get_item(item_id)
+    rows = await pool.fetch(
+        "SELECT id, pos FROM items WHERE set_id=$1 AND status IN ('draft','pending') ORDER BY pos", it["set_id"]
+    )
+    ids = [r["id"] for r in rows]
     if item_id not in ids:
         return False
-    idx = ids.index(item_id)
-    j = idx + direction
-    if j < 0 or j >= len(items):
+    i = ids.index(item_id)
+    j = i + direction
+    if j < 0 or j >= len(rows):
         return False
-    a, b = items[idx], items[j]
-    await pool.execute("UPDATE items SET pos=$2 WHERE id=$1", a["id"], b["pos"])
-    await pool.execute("UPDATE items SET pos=$2 WHERE id=$1", b["id"], a["pos"])
+    await pool.execute("UPDATE items SET pos=$2 WHERE id=$1", rows[i]["id"], rows[j]["pos"])
+    await pool.execute("UPDATE items SET pos=$2 WHERE id=$1", rows[j]["id"], rows[i]["pos"])
     return True
 
 
-async def mark_sent(item_id: int, ch_msg_id: int, delete_after: int) -> None:
+async def mark_sent(item_id: int, msg_ids: list[int]) -> None:
     await pool.execute(
-        "UPDATE items SET status='sent', sent_at=now(), ch_msg_id=$2, "
-        "delete_at = CASE WHEN $3::int > 0 THEN now() + make_interval(secs => $3::int) END WHERE id=$1",
-        item_id, ch_msg_id, delete_after,
+        "UPDATE items SET status='sent', sent_at=now(), ch_msg_ids=$2 WHERE id=$1",
+        item_id, ",".join(map(str, msg_ids)),
     )
 
 
+async def due_sends() -> list[dict]:
+    rows = await pool.fetch(
+        "SELECT i.* FROM items i JOIN sets s ON s.id=i.set_id "
+        "WHERE s.status='scheduled' AND i.status='pending' AND i.send_at <= now() ORDER BY i.send_at, i.pos"
+    )
+    return [dict(r) for r in rows]
+
+
 async def due_deletions() -> list[dict]:
-    rows = await pool.fetch("SELECT * FROM items WHERE status='sent' AND delete_at IS NOT NULL AND delete_at <= now()")
+    rows = await pool.fetch(
+        "SELECT * FROM items WHERE status='sent' AND delete_at IS NOT NULL AND delete_at <= now()"
+    )
+    return [dict(r) for r in rows]
+
+
+async def unfinished_sets() -> list[int]:
+    """Запущенные наборы, где уже нечего ни публиковать, ни удалять."""
+    rows = await pool.fetch(
+        """
+        SELECT s.id FROM sets s WHERE s.status='scheduled' AND NOT EXISTS (
+            SELECT 1 FROM items i WHERE i.set_id=s.id
+              AND (i.status='pending' OR (i.status='sent' AND i.delete_at IS NOT NULL)))
+        """
+    )
+    return [r["id"] for r in rows]
+
+
+async def timeline() -> list[dict]:
+    rows = await pool.fetch(
+        """
+        SELECT i.*, s.kind FROM items i JOIN sets s ON s.id=i.set_id
+        WHERE s.status='scheduled' AND (i.status='pending' OR (i.status='sent' AND i.delete_at IS NOT NULL))
+        """
+    )
     return [dict(r) for r in rows]

@@ -4,49 +4,113 @@ import logging
 import random
 import re
 import time
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from datetime import datetime
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandObject
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.filters import Command
 from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton as Btn,
     InlineKeyboardMarkup as Kb,
+    KeyboardButton,
     Message,
     MessageOriginChannel,
+    ReplyKeyboardMarkup,
 )
 
 import config
 import db
+import planner
 
 logging.basicConfig(level=logging.INFO)
 TZ = ZoneInfo(config.TIMEZONE)
 router = Router()
 router.message.filter(F.from_user.id == config.ADMIN_ID, F.chat.type == "private")
 router.callback_query.filter(F.from_user.id == config.ADMIN_ID)
+ADMIN = config.ADMIN_ID
 
-KIND = {"warmup": "🔥 Розігрів", "post": "📢 Пост", "reminder": "⏰ Нагадування"}
-ICON = {"warmup": "🔥", "post": "📢", "reminder": "⏰"}
-TTL = {120: "2 хв", 600: "10 хв", 3600: "1 год", 86400: "24 год", 0: "не видаляти"}
-
-# режим очікування наступного повідомлення: ("edit", id) | ("btn", id) | ("ins", id, kind) | ("channel",)
-mode: tuple | None = None
-
-# «Текст - https://…» (також приймаємо | та довге тире)
+KIND = {"single": "📝 Обычный пост", "mutual": "🤝 Взаимный пиар", "night": "🌙 Ночь"}
+ROLE = {"warmup": "🔥 Разогрев", "post": "📢 Пост", "reminder": "⏰ Напоминание"}
+ROLES = ["warmup", "post", "reminder"]
 BTN_RE = re.compile(r"^(.+?)\s*(?:\s[-–—]\s|\|)\s*((?:https?|tg)://\S+)$", re.S)
 
+MAIN_KB = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Создать пост"), KeyboardButton(text="Контент-план")],
+        [KeyboardButton(text="Изменить пост"), KeyboardButton(text="Настройки")],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+)
 
-# ---------- налаштування ----------
+# ---------- состояние интерфейса (бот для одного человека) ----------
+mode: tuple | None = None          # ожидаемый ввод: ("repl"|"media"|"btn", item_id) | ("ins", item_id, role) | ("time", set_id) | ("channel",)
+view: tuple | None = None          # что показано на «экране»: ("menu",) ("draft", sid) ("list",) ("set", sid) ("item", iid) ("plan",) ("settings",)
+scr_id: int | None = None          # id сообщения-экрана
+tmp_ids: list[int] = []            # временные сообщения бота, которые убираем после использования
+
+
+# ---------- утилиты ----------
+
+def now() -> datetime:
+    return datetime.now(TZ)
+
+
+def fmt(dt: datetime | None, with_date: bool = False) -> str:
+    if not dt:
+        return "—"
+    dt = dt.astimezone(TZ)
+    if with_date or dt.date() != now().date():
+        return dt.strftime("%d.%m %H:%M")
+    return dt.strftime("%H:%M")
+
+
+def plain(text_html: str) -> str:
+    return html.unescape(re.sub(r"<[^>]+>", "", text_html or ""))
+
+
+def snip(it: dict, n: int = 28) -> str:
+    t = plain(it["text_html"]).replace("\n", " ").strip()
+    if not t:
+        t = {"photo": "фото", "video": "видео", "animation": "гиф", "document": "файл"}.get(it["media_type"], "…")
+    return html.escape(t[:n] + ("…" if len(t) > n else ""))
+
+
+def flags(it: dict) -> str:
+    return (" 📎" if it["media_type"] else "") + (" 🔗" if it["btn_url"] else "") + (
+        " 🗑" if it["custom_ttl"] not in (None,) else "")
+
+
+def label(it: dict, kind: str) -> str:
+    if kind == "night" and it["role"] == "post":
+        return f"📢 Пост {it['part']}"
+    if kind == "night" and it["role"] == "reminder":
+        return f"⏰ Напоминание {it['part']}"
+    return ROLE[it["role"]]
+
+
+async def tmp(bot: Bot, text: str, kb: Kb | None = None) -> Message:
+    m = await bot.send_message(ADMIN, text, reply_markup=kb)
+    tmp_ids.append(m.message_id)
+    return m
+
+
+async def clear_tmp(bot: Bot) -> None:
+    ids = list(tmp_ids)
+    tmp_ids.clear()
+    for mid in ids:
+        try:
+            await bot.delete_message(ADMIN, mid)
+        except Exception:
+            pass
+
 
 async def gap() -> int:
     return int(await db.get_setting("gap", "120"))
-
-
-async def rem_ttl() -> int:
-    return int(await db.get_setting("rem_ttl", "120"))
 
 
 async def start_range() -> tuple[int, int]:
@@ -57,157 +121,401 @@ async def channel():
     v = await db.get_setting("channel") or config.CHANNEL_ID
     if not v:
         return None
-    return int(v) if v.lstrip("-").isdigit() else v
+    return int(v) if str(v).lstrip("-").isdigit() else v
 
 
-def fmt_time(ts: float) -> str:
-    return datetime.fromtimestamp(ts, TZ).strftime("%H:%M:%S")
+def extract(m: Message) -> dict | None:
+    """Достаёт из сообщения текст (с форматированием) и медиа. None, если тип не поддерживается."""
+    media_type = file_id = None
+    if m.photo:
+        media_type, file_id = "photo", m.photo[-1].file_id
+    elif m.video:
+        media_type, file_id = "video", m.video.file_id
+    elif m.animation:
+        media_type, file_id = "animation", m.animation.file_id
+    elif m.document:
+        media_type, file_id = "document", m.document.file_id
+    elif not m.text:
+        return None
+    return {"text_html": (m.html_text or "") if (m.text or m.caption) else "", "media_type": media_type, "file_id": file_id}
 
 
-def short(item: dict, n: int = 34) -> str:
-    return f"{ICON[item['kind']]} {item['preview'][:n] or '(медіа)'}"
-
-
-# ---------- черга ----------
-
-async def schedule_start() -> None:
-    """Викликається, коли в порожню чергу додали перше повідомлення."""
-    now = time.time()
-    last = float(await db.get_setting("last_sent", "0"))
-    g = await gap()
-    if last + g > now:
-        due = last + g
-    else:
-        lo, hi = await start_range()
-        due = now + random.randint(lo, hi)
-    await db.set_setting("next_due", str(due))
-
-
-async def add_item(msg: Message, kind: str, after_id: int | None = None) -> int:
-    if await db.pending() == []:
-        await schedule_start()
-    preview = msg.text or msg.caption or {
-        "photo": "фото", "video": "відео", "animation": "gif", "document": "файл",
-        "voice": "голосове", "video_note": "кружок", "audio": "аудіо", "sticker": "стікер",
-    }.get(msg.content_type, "медіа")
-    ttl = await rem_ttl() if kind == "reminder" else 0
-    return await db.add(kind, msg.chat.id, msg.message_id, preview.replace("\n", " "), ttl, after_id)
-
-
-def etas(items: list[dict], due: float, g: int) -> list[float]:
-    now = time.time()
-    t = max(due, now)
-    out = []
-    for _ in items:
-        out.append(t)
-        t += g
-    return out
-
-
-def kind_kb(current: str) -> list[Btn]:
-    return [Btn(text=("✓ " if k == current else "") + v, callback_data=f"k:{k}") for k, v in KIND.items()]
-
-
-async def next_kind_after(kind: str) -> str:
-    if kind == "warmup":
-        tail = await db.tail_kinds(2)
-        return "post" if tail == ["warmup", "warmup"] else "warmup"
-    return "reminder"
-
-
-async def panel(item_id: int) -> tuple[str, Kb]:
-    item = await db.get(item_id)
-    nk = await db.get_setting("next_kind", "warmup")
-    pend = await db.pending()
-    due = float(await db.get_setting("next_due", "0"))
-    ids = [p["id"] for p in pend]
-    when = ""
-    if item_id in ids:
-        when = fmt_time(etas(pend, due, await gap())[ids.index(item_id)])
-    paused = await db.get_setting("paused", "0") == "1"
-    text = (
-        f"✅ Додано: {KIND[item['kind']]}\n"
-        f"У черзі: {len(pend)}" + (f", вийде о {when}" if when else "") + ("\n⏸ Публікацію призупинено (/resume)" if paused else "")
-        + "\n\nЧим буде наступне повідомлення?"
-    )
-    kb = Kb(inline_keyboard=[
-        kind_kb(nk),
-        [Btn(text="🔗 Кнопка", callback_data=f"b:{item_id}"), Btn(text="🗑 Таймер", callback_data=f"t:{item_id}"),
-         Btn(text="📋 Черга", callback_data="q")],
-    ])
-    return text, kb
-
-
-async def queue_view() -> tuple[str, Kb]:
-    pend = await db.pending()
-    g = await gap()
-    due = float(await db.get_setting("next_due", "0"))
-    paused = await db.get_setting("paused", "0") == "1"
-    ch = await channel()
-    lines = [f"📋 <b>Черга</b> · {'⏸ пауза' if paused else '▶️ працює'} · пауза між кроками {g // 60} хв {g % 60} с"]
-    if not ch:
-        lines.append("⚠️ Канал не вибрано: /channel")
-    sent = await db.recent_sent(3)
-    if sent:
-        lines.append("\nОстанні опубліковані:")
-        for s in reversed(sent):
-            lines.append(f"• {fmt_time(s['sent_at'].timestamp())} {html.escape(short(s, 30))}"
-                         + (" (видалено)" if s["status"] == "deleted" else ""))
-    kb = []
-    if pend:
-        lines.append("\nДалі:")
-        for n, (it, t) in enumerate(zip(pend, etas(pend, due, g)), 1):
-            extra = " 🔗" if it["btn_url"] else ""
-            extra += f" 🗑{it['delete_after'] // 60}хв" if it["delete_after"] else ""
-            lines.append(f"{n}. {fmt_time(t)} {html.escape(short(it, 30))}{extra}")
-            kb.append([Btn(text=f"{n}. {short(it, 30)}", callback_data=f"i:{it['id']}")])
-    else:
-        lines.append("\nЧерга порожня. Просто кидай повідомлення, я їх опублікую.")
-    kb.append([Btn(text="🔄 Оновити", callback_data="q")])
-    return "\n".join(lines), Kb(inline_keyboard=kb[:40])
-
-
-def item_kb(it: dict) -> Kb:
-    i = it["id"]
-    return Kb(inline_keyboard=[
-        [Btn(text="✏️ Замінити", callback_data=f"e:{i}"), Btn(text="🔗 Кнопка", callback_data=f"b:{i}")],
-        [Btn(text="🗑 Таймер видалення", callback_data=f"t:{i}"), Btn(text="❌ З черги", callback_data=f"d:{i}")],
-        [Btn(text="⬆️", callback_data=f"u:{i}"), Btn(text="⬇️", callback_data=f"n:{i}")],
-        [Btn(text="➕ Вставити після:", callback_data="noop")],
-        [Btn(text=v, callback_data=f"ins:{i}:{k}") for k, v in KIND.items()],
-        [Btn(text="◀️ До черги", callback_data="q")],
-    ])
-
-
-def item_info(it: dict) -> str:
-    b = f"\n🔗 Кнопка: {html.escape(it['btn_text'])} → {html.escape(it['btn_url'])}" if it["btn_url"] else ""
-    ttl = f"видалити через {TTL.get(it['delete_after'], str(it['delete_after']) + ' с')}" if it["delete_after"] else "не видаляти"
-    return f"<b>{KIND[it['kind']]}</b>\nТаймер: {ttl}{b}"
-
-
-def markup_for(it: dict) -> Kb | None:
+def markup(it: dict) -> Kb | None:
     if it["btn_url"]:
         return Kb(inline_keyboard=[[Btn(text=it["btn_text"], url=it["btn_url"])]])
     return None
 
 
-async def show_item(chat_id: int, bot: Bot, item_id: int) -> None:
-    it = await db.get(item_id)
-    if not it or it["status"] != "pending":
-        await bot.send_message(chat_id, "Цього елемента вже немає в черзі.")
+async def send_item(bot: Bot, chat, it: dict) -> list[int]:
+    kb, text, mt, fid = markup(it), it["text_html"] or "", it["media_type"], it["file_id"]
+    if not mt:
+        return [(await bot.send_message(chat, text or "…", reply_markup=kb)).message_id]
+    sender = {"photo": bot.send_photo, "video": bot.send_video, "animation": bot.send_animation,
+              "document": bot.send_document}[mt]
+    if len(text) <= 1024:
+        return [(await sender(chat, **{mt: fid}, caption=text or None, reply_markup=kb)).message_id]
+    first = await sender(chat, **{mt: fid})
+    second = await bot.send_message(chat, text, reply_markup=kb)
+    return [first.message_id, second.message_id]
+
+
+def parse_when(text: str) -> datetime | None:
+    t = text.strip()
+    n = now()
+    for f in ("%d.%m.%Y %H:%M", "%d.%m %H:%M", "%H:%M"):
+        try:
+            d = datetime.strptime(t, f)
+        except ValueError:
+            continue
+        if f == "%H:%M":
+            d = n.replace(hour=d.hour, minute=d.minute, second=0, microsecond=0)
+            return d if d > n else d + timedelta(days=1)
+        if f == "%d.%m %H:%M":
+            d = d.replace(year=n.year, tzinfo=TZ)
+            return d if d >= n - timedelta(minutes=1) else d.replace(year=n.year + 1)
+        return d.replace(tzinfo=TZ)
+    return None
+
+
+# ---------- правила наборов ----------
+
+def check_add(kind: str, items: list[dict], role: str) -> tuple[bool, int, str]:
+    if kind != "night":
+        return True, 1, ""
+    posts = [i for i in items if i["role"] == "post"]
+    if role == "warmup":
+        if posts or sum(1 for i in items if i["role"] == "warmup") >= 2:
+            return False, 1, "В ночи разогревов не больше двух, и только перед первым постом."
+        return True, 1, ""
+    if role == "post":
+        if len(posts) >= 2:
+            return False, 2, "В ночи только два поста."
+        return True, len(posts) + 1, ""
+    if not posts:
+        return False, 1, "Сначала добавь пост, потом напоминания."
+    part = 2 if len(posts) == 2 else 1
+    if sum(1 for i in items if i["role"] == "reminder" and i["part"] == part) >= 3:
+        return False, part, "В каждой части ночи максимум 3 напоминания."
+    return True, part, ""
+
+
+def next_role_after(kind: str, items: list[dict], role: str) -> str:
+    if kind == "single":
+        return "post"
+    if role == "warmup":
+        run = 0
+        for it in reversed(items):
+            if it["role"] != "warmup":
+                break
+            run += 1
+        return "post" if run >= 2 else "warmup"
+    if kind == "night" and role == "reminder":
+        posts = sum(1 for i in items if i["role"] == "post")
+        n1 = sum(1 for i in items if i["role"] == "reminder" and i["part"] == 1)
+        if posts == 1 and n1 >= 3:
+            return "post"
+    return "reminder"
+
+
+# ---------- экраны ----------
+
+async def v_menu():
+    kb = Kb(inline_keyboard=[
+        [Btn(text=KIND["single"], callback_data="new:single")],
+        [Btn(text=KIND["mutual"], callback_data="new:mutual")],
+        [Btn(text=KIND["night"], callback_data="new:night")],
+        [Btn(text="❌ Отмена", callback_data="close")],
+    ])
+    return "Какой пост создаём?", kb
+
+
+async def v_draft(sid: int):
+    s = await db.get_set(sid)
+    if not s:
+        return await v_menu()
+    items = await db.items_of(sid)
+    lines = [f"<b>{KIND[s['kind']]}</b> · черновик", ""]
+    for n, it in enumerate(items, 1):
+        lines.append(f"{n}. {label(it, s['kind'])}: {snip(it)}{flags(it)}")
+    if s["kind"] == "single":
+        lines.append("" if items else "Отправь текст или фото с подписью: это будет пост. Новое сообщение заменит текущее.")
+    else:
+        if not items:
+            lines.append("Отправляй сообщения по очереди: разогрев, разогрев, пост, напоминания…")
+        nr = s["next_role"]
+        posts = sum(1 for i in items if i["role"] == "post")
+        nr_label = "📢 Пост 2" if s["kind"] == "night" and nr == "post" and posts == 1 else ROLE[nr]
+        lines += ["", f"Следующее сообщение будет: <b>{nr_label}</b>"]
+    if s["kind"] == "night":
+        lines.append("Ночь: разогревы и пост → напоминания 21:00, 22:00, 23:00 → в 00:00 пост 2 → напоминания 02:00, 04:00, 06:00 → в 08:00 всё удаляется. "
+                     "Если запуск поздний, график равномерно сожмётся.")
+    lo, hi = await start_range()
+    if s["start_at"]:
+        lines.append(f"🕐 Старт: {fmt(s['start_at'], True)}")
+    else:
+        lines.append("🕐 Старт: сразу" if s["kind"] == "single" else f"🕐 Старт: через {lo // 60}–{hi // 60} мин после запуска")
+    rows = []
+    if s["kind"] != "single":
+        rows.append([Btn(text=("✓ " if s["next_role"] == r else "") + ROLE[r], callback_data=f"nr:{sid}:{r}") for r in ROLES])
+    if items:
+        last = items[-1]["id"]
+        rows.append([Btn(text="📎 Медиа", callback_data=f"md:{last}"), Btn(text="🔗 Кнопка", callback_data=f"bt:{last}"),
+                     Btn(text="🗑 Таймер", callback_data=f"tm:{last}")])
+        extra = [Btn(text="👁 Предпросмотр", callback_data=f"pv:{last}")]
+        if s["kind"] != "single":
+            extra.insert(0, Btn(text="↩️ Убрать последнее", callback_data=f"rl:{sid}"))
+        rows.append(extra)
+    go = ("✅ Запланировать" if s["start_at"] else "🚀 Опубликовать") if s["kind"] == "single" else "🚀 Запустить"
+    rows.append([Btn(text="🕐 Время", callback_data=f"tp:{sid}"), Btn(text=go, callback_data=f"go:{sid}")])
+    rows.append([Btn(text="❌ Отмена", callback_data=f"x:{sid}")])
+    return "\n".join(lines), Kb(inline_keyboard=rows)
+
+
+async def v_list():
+    sets = await db.active_sets()
+    kb = []
+    for s in sets:
+        if s["status"] == "draft" and not s["n"]:
+            continue
+        when = "черновик" if s["status"] == "draft" else f"дальше {fmt(s['next_at'])}" if s["next_at"] else "идёт удаление"
+        kb.append([Btn(text=f"{KIND[s['kind']]} · {s['n']} шт. · {when}", callback_data=f"set:{s['id']}")])
+    if not kb:
+        return "Пока нет постов для изменения. Нажми «Создать пост».", Kb(inline_keyboard=[[Btn(text="✖️ Закрыть", callback_data="close")]])
+    kb.append([Btn(text="✖️ Закрыть", callback_data="close")])
+    return "Что изменить?", Kb(inline_keyboard=kb)
+
+
+async def v_set(sid: int):
+    s = await db.get_set(sid)
+    if not s or s["status"] != "scheduled":
+        return await v_list()
+    items = await db.items_of(sid)
+    lines = [f"<b>{KIND[s['kind']]}</b>", ""]
+    kb = []
+    for it in items:
+        if it["status"] == "pending":
+            lines.append(f"▫️ {fmt(it['send_at'])} {label(it, s['kind'])}: {snip(it)}{flags(it)}")
+            kb.append([Btn(text=f"{fmt(it['send_at'])} {label(it, s['kind'])}: {plain(it['text_html'])[:18] or '…'}", callback_data=f"it:{it['id']}")])
+        elif it["status"] == "sent":
+            d = f", удалится {fmt(it['delete_at'])}" if it["delete_at"] else ""
+            lines.append(f"✅ {fmt(it['sent_at'])} {label(it, s['kind'])}: {snip(it)}{d}")
+            if it["delete_at"]:
+                kb.append([Btn(text=f"✅ {fmt(it['sent_at'])} {label(it, s['kind'])} (в канале)", callback_data=f"it:{it['id']}")])
+        elif it["status"] == "deleted":
+            lines.append(f"▪️ {fmt(it['sent_at'])} {label(it, s['kind'])}: удалено")
+        elif it["status"] == "failed":
+            lines.append(f"❌ {label(it, s['kind'])}: не опубликовано")
+    kb = kb[:30]
+    kb.append([Btn(text="⏹ Остановить", callback_data=f"stop:{sid}"), Btn(text="⏹🗑 Остановить и удалить из канала", callback_data=f"stopdel:{sid}")])
+    kb.append([Btn(text="◀️ Назад", callback_data="list")])
+    return "\n".join(lines[:60]), Kb(inline_keyboard=kb)
+
+
+async def v_item(iid: int):
+    it = await db.get_item(iid)
+    if not it:
+        return await v_list()
+    s = await db.get_set(it["set_id"])
+    lines = [f"<b>{label(it, s['kind'])}</b>", ""]
+    t = plain(it["text_html"]).strip()
+    lines.append(html.escape(t[:300] + ("…" if len(t) > 300 else "")) or "(без текста)")
+    lines.append("")
+    if it["media_type"]:
+        lines.append("📎 Есть медиа")
+    if it["btn_url"]:
+        lines.append(f"🔗 {html.escape(it['btn_text'])} → {html.escape(it['btn_url'])}")
+    if it["status"] == "pending":
+        lines.append(f"Выйдет: {fmt(it['send_at'], True)}")
+    else:
+        lines.append(f"Опубликовано: {fmt(it['sent_at'], True)}")
+    ttl = it["custom_ttl"]
+    lines.append("Удаление: " + (f"{fmt(it['delete_at'], True)}" + (" (по таймеру)" if ttl else "") if it["delete_at"] else "не удаляется"))
+    rows = []
+    if it["status"] == "pending":
+        rows.append([Btn(text="✏️ Заменить", callback_data=f"rp:{iid}"), Btn(text="📎 Медиа", callback_data=f"md:{iid}")])
+        rows.append([Btn(text="🔗 Кнопка", callback_data=f"bt:{iid}"), Btn(text="🗑 Таймер", callback_data=f"tm:{iid}")])
+        if s["kind"] == "mutual":
+            rows.append([Btn(text="⬆️ Выше", callback_data=f"up:{iid}"), Btn(text="⬇️ Ниже", callback_data=f"dn:{iid}")])
+            rows.append([Btn(text="➕ Вставить после:", callback_data="noop")])
+            rows.append([Btn(text=ROLE[r], callback_data=f"in:{iid}:{r}") for r in ROLES])
+        rows.append([Btn(text="❌ Убрать из очереди", callback_data=f"rm:{iid}")])
+    else:
+        rows.append([Btn(text="🗑 Таймер", callback_data=f"tm:{iid}"), Btn(text="🗑 Удалить из канала сейчас", callback_data=f"dl:{iid}")])
+    rows.append([Btn(text="👁 Показать", callback_data=f"pv:{iid}"), Btn(text="◀️ Назад", callback_data=f"set:{it['set_id']}")])
+    return "\n".join(lines), Kb(inline_keyboard=rows)
+
+
+async def v_plan():
+    rows = await db.timeline()
+    events = []
+    for it in rows:
+        label_ = label(it, it["kind"])
+        if it["status"] == "pending":
+            events.append((it["send_at"], f"➕ {label_}: {snip(it, 22)}"))
+        if it["delete_at"]:
+            events.append((it["delete_at"], f"🗑 {label_}: {snip(it, 22)}"))
+    events.sort(key=lambda e: e[0])
+    if not events:
+        text = "Контент-план пуст. Нажми «Создать пост»."
+    else:
+        out, day = ["<b>Контент-план</b>"], None
+        for when, line in events[:40]:
+            d = when.astimezone(TZ).date()
+            if d != day:
+                day = d
+                out.append(f"\n<b>{d.strftime('%d.%m')}</b>")
+            out.append(f"{when.astimezone(TZ).strftime('%H:%M')} {line}")
+        text = "\n".join(out)
+    kb = Kb(inline_keyboard=[[Btn(text="🔄 Обновить", callback_data="plan"), Btn(text="✏️ Изменить пост", callback_data="list")],
+                             [Btn(text="✖️ Закрыть", callback_data="close")]])
+    return text, kb
+
+
+async def v_settings():
+    g = await gap()
+    lo, hi = await start_range()
+    title = await db.get_setting("channel_title") or "не выбран"
+    text = (f"<b>Настройки</b>\n\n📣 Канал: {html.escape(title)}\n⏱ Пауза между шагами: {g // 60} мин\n"
+            f"⏳ Старт после запуска: {lo // 60}–{hi // 60} мин\n🕐 Часовой пояс: {config.TIMEZONE}")
+    kb = Kb(inline_keyboard=[
+        [Btn(text="📣 Выбрать канал", callback_data="cfg:channel")],
+        [Btn(text=("✓ " if g == v else "") + f"{v // 60} мин", callback_data=f"cfg:gap:{v}") for v in (60, 120, 180, 300)],
+        [Btn(text=("✓ " if (lo, hi) == (a, b) else "") + f"{a // 60}–{b // 60} мин", callback_data=f"cfg:start:{a}:{b}")
+         for a, b in ((0, 60), (120, 300), (300, 600))],
+        [Btn(text="✖️ Закрыть", callback_data="close")],
+    ])
+    return text, kb
+
+
+async def build_view():
+    v = view
+    if v[0] == "menu":
+        return await v_menu()
+    if v[0] == "draft":
+        return await v_draft(v[1])
+    if v[0] == "list":
+        return await v_list()
+    if v[0] == "set":
+        return await v_set(v[1])
+    if v[0] == "item":
+        return await v_item(v[1])
+    if v[0] == "plan":
+        return await v_plan()
+    return await v_settings()
+
+
+async def delete_screen(bot: Bot) -> None:
+    global scr_id
+    if scr_id:
+        try:
+            await bot.delete_message(ADMIN, scr_id)
+        except Exception:
+            pass
+    scr_id = None
+
+
+async def render(bot: Bot, fresh: bool = False) -> None:
+    global scr_id
+    if view is None:
+        await delete_screen(bot)
+        return
+    text, kb = await build_view()
+    if fresh or not scr_id:
+        await delete_screen(bot)
+        scr_id = (await bot.send_message(ADMIN, text, reply_markup=kb)).message_id
         return
     try:
-        await bot.copy_message(chat_id, it["src_chat"], it["src_msg"], reply_markup=markup_for(it))
-    except Exception:
-        await bot.send_message(chat_id, "⚠️ Не вдалося показати оригінал (повідомлення видалене?). Заміни його.")
-    await bot.send_message(chat_id, item_info(it), reply_markup=item_kb(it))
+        await bot.edit_message_text(text, chat_id=ADMIN, message_id=scr_id, reply_markup=kb)
+    except TelegramBadRequest as e:
+        if "not modified" not in str(e):
+            await delete_screen(bot)
+            scr_id = (await bot.send_message(ADMIN, text, reply_markup=kb)).message_id
+
+
+async def open_view(bot: Bot, v: tuple | None, fresh: bool = False) -> None:
+    global view, mode
+    mode = None
+    await clear_tmp(bot)
+    view = v
+    await render(bot, fresh)
+
+
+# ---------- планирование ----------
+
+async def apply_plan(plan: dict, items: list[dict]) -> None:
+    for it in items:
+        if it["id"] not in plan:
+            continue
+        send_at, delete_at = plan[it["id"]]
+        if it["status"] in ("draft", "pending"):
+            await db.upd_item(it["id"], send_at=send_at, delete_at=delete_at, status="pending")
+        elif it["status"] == "sent":
+            await db.upd_item(it["id"], delete_at=delete_at)
+
+
+async def replan(sid: int) -> None:
+    s = await db.get_set(sid)
+    if not s or s["status"] != "scheduled":
+        return
+    items = [i for i in await db.items_of(sid) if i["status"] != "failed"]
+    if s["kind"] == "mutual":
+        plan = planner.plan_mutual(items, s["start_at"] or now(), await gap(), now())
+    elif s["kind"] == "night":
+        send = {i["id"]: (i["sent_at"] if i["status"] in ("sent", "deleted") else i["send_at"]) for i in items
+                if i["send_at"] or i["sent_at"]}
+        plan = planner.night_deletes(items, send, s["p2_at"], s["end_at"])
+    else:
+        plan = {i["id"]: (i["send_at"], i["send_at"] + timedelta(seconds=i["custom_ttl"]) if i["custom_ttl"] else None)
+                for i in items if i["send_at"]}
+    await apply_plan(plan, items)
+
+
+async def launch(bot: Bot, sid: int) -> str | None:
+    """Возвращает текст ошибки или None, если запущено."""
+    s = await db.get_set(sid)
+    items = await db.items_of(sid)
+    if not await channel():
+        return "Сначала выбери канал: Настройки → Выбрать канал."
+    if not items:
+        return "Сначала добавь сообщение."
+    n = now()
+    lo, hi = await start_range()
+    g = await gap()
+    start = s["start_at"] if s["start_at"] and s["start_at"] > n else None
+    if s["kind"] == "single":
+        start = start or n
+        ttl = items[0]["custom_ttl"]
+        await db.upd_item(items[0]["id"], send_at=start, status="pending",
+                          delete_at=start + timedelta(seconds=ttl) if ttl else None)
+    elif s["kind"] == "mutual":
+        start = start or n + timedelta(seconds=random.randint(lo, hi))
+        await apply_plan(planner.plan_mutual(items, start, g, n), items)
+    else:
+        if not any(i["role"] == "post" and i["part"] == 1 for i in items):
+            return "В ночи нужен хотя бы один пост."
+        start = start or n + timedelta(seconds=random.randint(lo, hi))
+        plan, p2_at, end_at = planner.plan_night(items, start, g, TZ)
+        await apply_plan(plan, items)
+        await db.upd_set(sid, p2_at=p2_at, end_at=end_at)
+    await db.upd_set(sid, status="scheduled", start_at=start)
+    return None
+
+
+async def summary(sid: int) -> str:
+    s = await db.get_set(sid)
+    items = await db.items_of(sid)
+    lines = [f"✅ {KIND[s['kind']]} запущен. Расписание:"]
+    for it in items:
+        d = f" → удалится {fmt(it['delete_at'])}" if it["delete_at"] else ""
+        lines.append(f"{fmt(it['send_at'])} {label(it, s['kind'])}{d}")
+    return "\n".join(lines[:40])
 
 
 # ---------- воркер ----------
 
 async def notify(bot: Bot, text: str) -> None:
     try:
-        await bot.send_message(config.ADMIN_ID, text)
+        await bot.send_message(ADMIN, text)
     except Exception:
         logging.exception("notify failed")
 
@@ -216,31 +524,26 @@ async def tick(bot: Bot) -> None:
     ch = await channel()
     for it in await db.due_deletions():
         try:
-            if ch:
-                await bot.delete_message(ch, it["ch_msg_id"])
-        except Exception as e:
-            logging.warning("delete failed: %s", e)
-        await db.update(it["id"], status="deleted", delete_at=None)
-    if not ch or await db.get_setting("paused", "0") == "1":
-        return
-    if time.time() < float(await db.get_setting("next_due", "0")):
-        return
-    pend = await db.pending()
-    if not pend:
-        return
-    it = pend[0]
-    now = time.time()
-    try:
-        sent = await bot.copy_message(ch, it["src_chat"], it["src_msg"], reply_markup=markup_for(it))
-        await db.mark_sent(it["id"], sent.message_id, it["delete_after"])
-    except Exception as e:
-        await db.update(it["id"], status="failed")
-        await notify(bot, f"❌ Не вдалося опублікувати {html.escape(short(it))}: {html.escape(str(e))}\n"
-                          "Перевір, що бот адмін каналу й повідомлення не видалене.")
-    await db.set_setting("last_sent", str(now))
-    await db.set_setting("next_due", str(now + await gap()))
-    if len(pend) == 1:
-        await notify(bot, "✅ Усе з черги опубліковано.")
+            if ch and it["ch_msg_ids"]:
+                for mid in it["ch_msg_ids"].split(","):
+                    try:
+                        await bot.delete_message(ch, int(mid))
+                    except Exception as e:
+                        logging.warning("delete failed: %s", e)
+        finally:
+            await db.upd_item(it["id"], status="deleted", delete_at=None)
+    if ch:
+        for it in await db.due_sends():
+            try:
+                ids = await send_item(bot, ch, it)
+                await db.mark_sent(it["id"], ids)
+            except Exception as e:
+                await db.upd_item(it["id"], status="failed")
+                await notify(bot, f"❌ Не удалось опубликовать «{html.escape(plain(it['text_html'])[:30])}»: {html.escape(str(e))}\n"
+                                  "Проверь, что бот админ канала с правом публиковать сообщения.")
+    for sid in await db.unfinished_sets():
+        await db.upd_set(sid, status="done")
+        await notify(bot, "✅ Набор полностью отработан.")
 
 
 async def worker(bot: Bot) -> None:
@@ -252,235 +555,372 @@ async def worker(bot: Bot) -> None:
         await asyncio.sleep(3)
 
 
-# ---------- команди ----------
+# ---------- команды и кнопки нижней клавиатуры ----------
 
 HELP = (
-    "<b>Як користуватись</b>\n"
-    "Кидай мені повідомлення по черзі: розігрів, розігрів, пост, нагадування, нагадування… "
-    "Тип наступного я підказую сам, його можна змінити кнопками під повідомленням.\n"
-    "Перше повідомлення вийде в канал через 2–5 хв, далі кожен крок через 2 хв. "
-    "Нагадування видаляються з каналу через 2 хв після публікації.\n\n"
-    "/queue або /contentplan: черга з часом виходу й редагуванням\n"
-    "/pause, /resume: пауза та продовження\n"
-    "/channel: вибрати канал (бот має бути адміном)\n"
-    "/gap 120: пауза між кроками, секунди\n"
-    "/ttl 120: через скільки секунд видаляти нагадування\n"
-    "/startdelay 120 300: затримка першого повідомлення, секунди (від і до)\n"
-    "/clear: очистити чергу\n\n"
-    "Фото, відео, гіфки, форматований текст (жирний, емодзі) підтримуються. Альбоми поки по одному елементу."
+    "Привет! Нижние кнопки: «Создать пост», «Контент-план», «Изменить пост», «Настройки».\n\n"
+    "Сначала зайди в «Настройки» и выбери канал (бот должен быть админом канала с правом публиковать и удалять сообщения)."
 )
 
 
 @router.message(Command("start", "help"))
-async def cmd_start(m: Message):
-    await m.answer(HELP)
+async def cmd_start(m: Message, bot: Bot):
+    await m.answer(HELP, reply_markup=MAIN_KB)
 
 
-@router.message(Command("queue", "contentplan"))
-async def cmd_queue(m: Message):
-    text, kb = await queue_view()
-    await m.answer(text, reply_markup=kb)
+@router.message(F.text == "Создать пост")
+async def btn_new(m: Message, bot: Bot):
+    await db.drop_empty_drafts()
+    await open_view(bot, ("menu",), fresh=True)
 
 
-@router.message(Command("pause"))
-async def cmd_pause(m: Message):
-    await db.set_setting("paused", "1")
-    await m.answer("⏸ Призупинено. /resume, щоб продовжити.")
+@router.message(F.text == "Контент-план")
+async def btn_plan(m: Message, bot: Bot):
+    await open_view(bot, ("plan",), fresh=True)
 
 
-@router.message(Command("resume"))
-async def cmd_resume(m: Message):
-    await db.set_setting("paused", "0")
-    now = time.time()
-    if float(await db.get_setting("next_due", "0")) < now + 30:
-        await db.set_setting("next_due", str(now + 30))
-    await m.answer("▶️ Продовжую, наступне вийде приблизно через 30 с.")
+@router.message(F.text == "Изменить пост")
+async def btn_edit(m: Message, bot: Bot):
+    await open_view(bot, ("list",), fresh=True)
 
 
-async def _int_setting(m: Message, c: CommandObject, key: str, label: str):
-    if not c.args or not c.args.strip().isdigit():
-        await m.answer(f"Вкажи число секунд, напр. /{m.text.split()[0][1:]} 120")
-        return
-    await db.set_setting(key, c.args.strip())
-    await m.answer(f"Готово: {label} = {c.args.strip()} с.")
+@router.message(F.text == "Настройки")
+async def btn_settings(m: Message, bot: Bot):
+    await open_view(bot, ("settings",), fresh=True)
 
 
-@router.message(Command("gap"))
-async def cmd_gap(m: Message, command: CommandObject):
-    await _int_setting(m, command, "gap", "пауза між кроками")
-
-
-@router.message(Command("ttl"))
-async def cmd_ttl(m: Message, command: CommandObject):
-    await _int_setting(m, command, "rem_ttl", "видалення нагадувань (для нових)")
-
-
-@router.message(Command("startdelay"))
-async def cmd_startdelay(m: Message, command: CommandObject):
-    parts = (command.args or "").split()
-    if len(parts) != 2 or not all(p.isdigit() for p in parts) or int(parts[0]) > int(parts[1]):
-        await m.answer("Приклад: /startdelay 120 300")
-        return
-    await db.set_setting("start_min", parts[0])
-    await db.set_setting("start_max", parts[1])
-    await m.answer(f"Перше повідомлення виходитиме через {parts[0]}–{parts[1]} с.")
-
-
-@router.message(Command("clear"))
-async def cmd_clear(m: Message):
-    await m.answer("Очистити всю чергу?", reply_markup=Kb(inline_keyboard=[[
-        Btn(text="Так, очистити", callback_data="clear"), Btn(text="Ні", callback_data="q")]]))
-
-
-async def set_channel(m: Message, value) -> None:
+async def set_channel(m: Message, bot: Bot, value) -> None:
     global mode
     try:
-        chat = await m.bot.get_chat(value)
-        me = await m.bot.get_me()
-        member = await m.bot.get_chat_member(chat.id, me.id)
+        chat = await bot.get_chat(value)
+        me = await bot.get_me()
+        member = await bot.get_chat_member(chat.id, me.id)
         if member.status not in ("administrator", "creator"):
-            await m.answer(f"Канал «{html.escape(chat.title or str(chat.id))}» знайдено, але бот не адмін. Додай його з правом публікувати й видаляти повідомлення.")
+            await tmp(bot, f"Канал «{html.escape(chat.title or "")}» найден, но бот не админ. Добавь его с правом публиковать и удалять сообщения и пришли пост ещё раз.")
+            return
+        if member.status == "administrator" and not (getattr(member, "can_post_messages", True) and getattr(member, "can_delete_messages", True)):
+            await tmp(bot, "Боту не хватает прав: нужны «Публикация сообщений» и «Удаление сообщений». Включи их и пришли пост ещё раз.")
             return
     except Exception as e:
-        await m.answer(f"Не вдалося отримати канал: {html.escape(str(e))}\nДодай бота адміном і спробуй ще раз.")
+        await tmp(bot, f"Не удалось получить канал: {html.escape(str(e))}\nДобавь бота админом и попробуй ещё раз.")
         return
-    await db.set_setting("channel", str(chat.id))
+    await db.set_setting("channel", chat.id)
+    await db.set_setting("channel_title", chat.title or str(chat.id))
     mode = None
-    await m.answer(f"✅ Канал: {html.escape(chat.title or str(chat.id))}")
+    await clear_tmp(bot)
+    await render(bot)
 
 
-@router.message(Command("channel"))
-async def cmd_channel(m: Message, command: CommandObject):
-    global mode
-    if command.args:
-        a = command.args.strip()
-        await set_channel(m, int(a) if a.lstrip("-").isdigit() else a)
+# ---------- ввод пользователя ----------
+
+async def add_to_draft(bot: Bot, s: dict, data: dict, after_id: int | None = None, role: str | None = None) -> None:
+    items = await db.items_of(s["id"])
+    if s["kind"] == "single":
+        if items:
+            await db.upd_item(items[0]["id"], **data)
+        else:
+            await db.add_item(s["id"], "post", 1, data, "draft")
         return
-    mode = ("channel",)
-    await m.answer("Перешли мені будь-який пост із каналу (або надішли @username / ID). Бот має бути адміном каналу.")
+    role = role or s["next_role"]
+    ok, part, msg = check_add(s["kind"], items, role)
+    if not ok:
+        await tmp(bot, "⚠️ " + msg)
+        return
+    status = "draft" if s["status"] == "draft" else "pending"
+    iid = await db.add_item(s["id"], role, part, data, status, after_id)
+    if s["status"] == "draft":
+        items = await db.items_of(s["id"])
+        await db.upd_set(s["id"], next_role=next_role_after(s["kind"], items, role))
+    else:
+        await replan(s["id"])
 
-
-# ---------- прийом повідомлень ----------
 
 @router.message()
-async def on_message(m: Message):
-    global mode
+async def on_message(m: Message, bot: Bot):
+    global mode, view
     cur = mode
+
     if cur and cur[0] == "channel":
         if isinstance(m.forward_origin, MessageOriginChannel):
-            await set_channel(m, m.forward_origin.chat.id)
+            await set_channel(m, bot, m.forward_origin.chat.id)
         elif m.text:
             t = m.text.strip()
-            await set_channel(m, int(t) if t.lstrip("-").isdigit() else t)
-        return
-    if cur and cur[0] == "btn":
-        it = await db.get(cur[1])
-        mode = None
-        t = (m.text or "").strip()
-        if t.lower() in ("прибрати", "-", "видалити"):
-            await db.update(cur[1], btn_text=None, btn_url=None)
-            await m.answer("Кнопку прибрано.")
-        elif (mt := BTN_RE.match(t)):
-            await db.update(cur[1], btn_text=mt.group(1).strip()[:60], btn_url=mt.group(2))
-            await m.answer("🔗 Кнопку додано.")
-        else:
-            mode = cur
-            await m.answer("Формат: Текст кнопки - https://посилання (або «прибрати»).")
-            return
-        if it:
-            await show_item(m.chat.id, m.bot, cur[1])
-        return
-    if cur and cur[0] == "edit":
-        mode = None
-        it = await db.get(cur[1])
-        if it and it["status"] == "pending":
-            preview = (m.text or m.caption or "(медіа)").replace("\n", " ")
-            await db.update(cur[1], src_chat=m.chat.id, src_msg=m.message_id, preview=preview)
-            await m.answer("✏️ Замінено.")
-            await show_item(m.chat.id, m.bot, cur[1])
-        else:
-            await m.answer("Цього елемента вже немає в черзі.")
-        return
-    if cur and cur[0] == "ins":
-        mode = None
-        new_id = await add_item(m, cur[2], after_id=cur[1])
-        text, kb = await panel(new_id)
-        await m.answer(text.replace("\n\nЧим буде наступне повідомлення?", ""), reply_markup=Kb(inline_keyboard=[kb.inline_keyboard[1]]))
+            await set_channel(m, bot, int(t) if t.lstrip("-").isdigit() else t)
         return
 
-    # звичайне додавання в кінець черги
-    kind = await db.get_setting("next_kind", "warmup")
-    item_id = await add_item(m, kind)
-    await db.set_setting("next_kind", await next_kind_after(kind))
-    text, kb = await panel(item_id)
-    await m.answer(text, reply_markup=kb, reply_to_message_id=m.message_id)
+    if cur and cur[0] == "time":
+        when = parse_when(m.text or "")
+        if not when:
+            await tmp(bot, "Не понял время. Примеры: 21:30 или 05.10 08:00")
+            return
+        await db.upd_set(cur[1], start_at=when)
+        await finish_set_time(bot, cur[1])
+        return
+
+    if cur and cur[0] == "btn":
+        t = (m.text or "").strip()
+        if t.lower() in ("убрать", "-", "удалить"):
+            await db.upd_item(cur[1], btn_text=None, btn_url=None)
+        elif (mt := BTN_RE.match(t)):
+            await db.upd_item(cur[1], btn_text=mt.group(1).strip()[:60], btn_url=mt.group(2))
+        else:
+            await tmp(bot, "Формат: Текст кнопки - https://ссылка (или слово «убрать»).")
+            return
+        await after_item_change(bot, cur[1])
+        return
+
+    if cur and cur[0] in ("media", "repl", "ins"):
+        data = extract(m)
+        if data is None:
+            await tmp(bot, "Этот тип сообщения не поддерживается. Отправь текст, фото, видео, гиф или файл.")
+            return
+        if cur[0] == "media":
+            if not data["media_type"]:
+                await tmp(bot, "Нужно фото, видео, гиф или файл.")
+                return
+            await db.upd_item(cur[1], media_type=data["media_type"], file_id=data["file_id"])
+            await after_item_change(bot, cur[1])
+        elif cur[0] == "repl":
+            await db.upd_item(cur[1], **data)
+            await after_item_change(bot, cur[1])
+        else:
+            it = await db.get_item(cur[1])
+            s = await db.get_set(it["set_id"])
+            await add_to_draft(bot, s, data, after_id=cur[1], role=cur[2])
+            mode = None
+            await clear_tmp(bot)
+            await render(bot)
+        return
+
+    # обычное сообщение: добавляем в открытый черновик
+    if view and view[0] == "draft":
+        s = await db.get_set(view[1])
+        data = extract(m)
+        if s and data:
+            await clear_tmp(bot)
+            await add_to_draft(bot, s, data)
+            await render(bot)
+            return
+        await tmp(bot, "Этот тип сообщения не поддерживается. Отправь текст, фото, видео, гиф или файл.")
+        return
+    await tmp(bot, "Нажми «Создать пост» внизу, чтобы начать.")
+
+
+async def after_item_change(bot: Bot, item_id: int) -> None:
+    global mode
+    mode = None
+    await clear_tmp(bot)
+    it = await db.get_item(item_id)
+    if it:
+        s = await db.get_set(it["set_id"])
+        if s and s["status"] == "scheduled":
+            await replan(s["id"])
+    await render(bot)
+
+
+async def finish_set_time(bot: Bot, sid: int) -> None:
+    global mode
+    mode = None
+    await clear_tmp(bot)
+    await render(bot)
 
 
 # ---------- кнопки ----------
 
+def quick_times() -> list[tuple[str, int]]:
+    n = now()
+    out = [("через 15 мин", n + timedelta(minutes=15)), ("через 30 мин", n + timedelta(minutes=30)),
+           ("через 1 час", n + timedelta(hours=1)), ("через 2 часа", n + timedelta(hours=2))]
+    h = n.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    for i in range(8):
+        t = h + timedelta(hours=i)
+        out.append((t.strftime("%H:%M"), t))
+    return [(a, int(b.timestamp())) for a, b in out]
+
+
 @router.callback_query()
-async def on_cb(c: CallbackQuery):
-    global mode
+async def on_cb(c: CallbackQuery, bot: Bot):
+    global mode, view
     data = c.data or ""
-    bot, chat_id = c.bot, c.message.chat.id
-    if data == "noop":
+    action, _, rest = data.partition(":")
+    parts = rest.split(":") if rest else []
+
+    if action == "noop":
         await c.answer()
         return
-    if data == "q":
+    if action == "close":
+        await open_view(bot, None)
+        await c.answer()
+        return
+    if action in ("plan", "list"):
+        await open_view(bot, (action,))
+        await c.answer()
+        return
+    if action == "new":
+        await db.drop_empty_drafts()
+        sid = await db.new_set(parts[0])
+        await open_view(bot, ("draft", sid))
+        await c.answer()
+        return
+    if action == "cfg":
+        if parts[0] == "channel":
+            mode = ("channel",)
+            await tmp(bot, "Перешли мне любой пост из канала (или отправь @username / ID канала). Бот должен быть админом канала.",
+                      Kb(inline_keyboard=[[Btn(text="Отмена", callback_data="cancel")]]))
+        elif parts[0] == "gap":
+            await db.set_setting("gap", parts[1])
+            await render(bot)
+        elif parts[0] == "start":
+            await db.set_setting("start_min", parts[1])
+            await db.set_setting("start_max", parts[2])
+            await render(bot)
+        await c.answer()
+        return
+    if action == "cancel":
         mode = None
-        text, kb = await queue_view()
-        try:
-            await c.message.edit_text(text, reply_markup=kb)
-        except Exception:
-            await bot.send_message(chat_id, text, reply_markup=kb)
+        await clear_tmp(bot)
         await c.answer()
         return
-    if data == "clear":
-        await db.clear_pending()
-        await c.message.edit_text("🧹 Чергу очищено.")
+
+    if action == "nr":
+        await db.upd_set(int(parts[0]), next_role=parts[1])
+        await render(bot)
         await c.answer()
         return
-    kind, _, rest = data.partition(":")
-    if kind == "k":
-        await db.set_setting("next_kind", rest)
-        rows = c.message.reply_markup.inline_keyboard if c.message.reply_markup else []
-        if rows:
-            rows = [kind_kb(rest)] + [list(r) for r in rows[1:]]
-            await c.message.edit_reply_markup(reply_markup=Kb(inline_keyboard=rows))
-        await c.answer(f"Далі: {KIND[rest]}")
+    if action == "rl":
+        items = await db.items_of(int(parts[0]))
+        if items:
+            await db.del_item(items[-1]["id"])
+            s = await db.get_set(int(parts[0]))
+            items = await db.items_of(s["id"])
+            await db.upd_set(s["id"], next_role=next_role_after(s["kind"], items, items[-1]["role"]) if items else "warmup")
+        await render(bot)
+        await c.answer()
         return
-    parts = rest.split(":")
-    item_id = int(parts[0])
-    it = await db.get(item_id)
-    if not it or it["status"] != "pending":
-        await c.answer("Цього елемента вже немає в черзі", show_alert=True)
+    if action == "x":
+        sid = int(parts[0])
+        await db.delete_set(sid)
+        await open_view(bot, None)
+        await c.answer("Отменено")
         return
-    if kind == "i":
-        await show_item(chat_id, bot, item_id)
-    elif kind == "e":
-        mode = ("edit", item_id)
-        await bot.send_message(chat_id, "Надішли нове повідомлення, воно замінить це.")
-    elif kind == "b":
-        mode = ("btn", item_id)
-        await bot.send_message(chat_id, "Надішли: <code>Текст кнопки - https://посилання</code>\nАбо «прибрати».")
-    elif kind == "t":
-        await bot.send_message(chat_id, "Через скільки після публікації видалити з каналу?", reply_markup=Kb(inline_keyboard=[
-            [Btn(text=v, callback_data=f"ts:{item_id}:{k_}") for k_, v in list(TTL.items())[:3]],
-            [Btn(text=v, callback_data=f"ts:{item_id}:{k_}") for k_, v in list(TTL.items())[3:]],
-        ]))
-    elif kind == "ts":
-        await db.update(item_id, delete_after=int(parts[1]))
-        await c.message.edit_text(f"🗑 Таймер: {TTL.get(int(parts[1]))}")
-    elif kind == "d":
-        await db.remove(item_id)
-        await c.message.edit_text("❌ Видалено з черги.")
-    elif kind in ("u", "n"):
-        ok = await db.move(item_id, -1 if kind == "u" else 1)
-        await c.answer("Переміщено" if ok else "Далі нікуди")
+    if action == "tp":
+        sid = int(parts[0])
+        s = await db.get_set(sid)
+        mode = ("time", sid)
+        await clear_tmp(bot)
+        qt = quick_times()
+        auto = "Сейчас" if s["kind"] == "single" else "Авто"
+        rows = [[Btn(text=auto, callback_data=f"ts:{sid}:0")]]
+        for i in range(0, len(qt), 4):
+            rows.append([Btn(text=a, callback_data=f"ts:{sid}:{b}") for a, b in qt[i:i + 4]])
+        rows.append([Btn(text="Отмена", callback_data="cancel")])
+        await tmp(bot, "Когда стартуем? Выбери время кнопкой или напиши, например: 21:30 или 05.10 08:00", Kb(inline_keyboard=rows))
+        await c.answer()
         return
-    elif kind == "ins":
-        mode = ("ins", item_id, parts[1])
-        await bot.send_message(chat_id, f"Надішли повідомлення, воно стане «{KIND[parts[1]]}» одразу після цього.")
+    if action == "ts":
+        sid, ts = int(parts[0]), int(parts[1])
+        await db.upd_set(sid, start_at=datetime.fromtimestamp(ts, TZ) if ts else None)
+        await finish_set_time(bot, sid)
+        await c.answer()
+        return
+    if action == "go":
+        sid = int(parts[0])
+        err = await launch(bot, sid)
+        if err:
+            await c.answer(err, show_alert=True)
+            return
+        text = await summary(sid)
+        await open_view(bot, None)
+        await bot.send_message(ADMIN, text)
+        await c.answer()
+        return
+    if action == "set":
+        s = await db.get_set(int(parts[0]))
+        if s and s["status"] == "draft":
+            await open_view(bot, ("draft", s["id"]))
+        else:
+            await open_view(bot, ("set", int(parts[0])))
+        await c.answer()
+        return
+    if action in ("stop", "stopdel"):
+        sid = int(parts[0])
+        items = await db.items_of(sid)
+        for it in items:
+            if it["status"] in ("draft", "pending"):
+                await db.del_item(it["id"])
+            elif it["status"] == "sent":
+                await db.upd_item(it["id"], delete_at=now() if action == "stopdel" else None)
+        await db.upd_set(sid, status="cancelled")
+        await open_view(bot, ("list",))
+        await c.answer("Остановлено")
+        return
+    if action == "it":
+        await open_view(bot, ("item", int(parts[0])))
+        await c.answer()
+        return
+
+    # дальше действия над конкретным элементом
+    if action in ("md", "bt", "tm", "pv", "rp", "rm", "up", "dn", "in", "dl", "tt", "mx"):
+        iid = int(parts[0])
+        it = await db.get_item(iid)
+        if not it:
+            await c.answer("Этого элемента уже нет", show_alert=True)
+            return
+        cancel_kb = Kb(inline_keyboard=[[Btn(text="Отмена", callback_data="cancel")]])
+        if action == "md":
+            await clear_tmp(bot)
+            mode = ("media", iid)
+            rows = [[Btn(text="Отмена", callback_data="cancel")]]
+            if it["media_type"]:
+                rows.insert(0, [Btn(text="🗑 Убрать медиа", callback_data=f"mx:{iid}")])
+            await tmp(bot, "Отправь фото, видео, гиф или файл.", Kb(inline_keyboard=rows))
+        elif action == "mx":
+            await db.upd_item(iid, media_type=None, file_id=None)
+            await after_item_change(bot, iid)
+        elif action == "bt":
+            await clear_tmp(bot)
+            mode = ("btn", iid)
+            await tmp(bot, "Отправь кнопку в формате:\nТекст кнопки - https://ссылка\nИли слово «убрать».", cancel_kb)
+        elif action == "rp":
+            await clear_tmp(bot)
+            mode = ("repl", iid)
+            await tmp(bot, "Отправь новое сообщение (текст или фото с подписью): оно заменит это.", cancel_kb)
+        elif action == "tm":
+            await clear_tmp(bot)
+            def tb(n, v):
+                return Btn(text=n, callback_data=f"tt:{iid}:{v}")
+            grid = [[tb("Авто (по правилам набора)", "a")], [tb("2 мин", "120"), tb("10 мин", "600"), tb("1 час", "3600")],
+                    [tb("24 часа", "86400"), tb("Не удалять", "0")], [Btn(text="Отмена", callback_data="cancel")]]
+            await tmp(bot, "Через сколько после публикации удалить это из канала?", Kb(inline_keyboard=grid))
+        elif action == "tt":
+            v = parts[1]
+            await db.upd_item(iid, custom_ttl=None if v == "a" else int(v))
+            if v != "a" and it["status"] == "sent" and int(v) > 0:
+                await db.upd_item(iid, delete_at=it["sent_at"] + timedelta(seconds=int(v)))
+            elif v == "0":
+                await db.upd_item(iid, delete_at=None)
+            await after_item_change(bot, iid)
+        elif action == "pv":
+            m = await send_item(bot, ADMIN, it)
+            tmp_ids.extend(m)
+            await tmp(bot, "Так выглядит пост.", Kb(inline_keyboard=[[Btn(text="✖️ Закрыть", callback_data="cancel")]]))
+        elif action == "rm":
+            await db.del_item(iid)
+            await replan(it["set_id"])
+            await open_view(bot, ("set", it["set_id"]))
+        elif action in ("up", "dn"):
+            await db.move(iid, -1 if action == "up" else 1)
+            await replan(it["set_id"])
+            await render(bot)
+        elif action == "in":
+            await clear_tmp(bot)
+            mode = ("ins", iid, parts[1])
+            await tmp(bot, f"Отправь сообщение: оно станет «{ROLE[parts[1]]}» сразу после этого.", cancel_kb)
+        elif action == "dl":
+            await db.upd_item(iid, delete_at=now())
+            await open_view(bot, ("set", it["set_id"]))
+        await c.answer()
+        return
     await c.answer()
 
 
