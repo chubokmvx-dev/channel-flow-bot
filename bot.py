@@ -50,6 +50,7 @@ MAIN_KB = ReplyKeyboardMarkup(
 
 # ---------- состояние интерфейса (бот для одного человека) ----------
 mode: tuple | None = None          # ожидаемый ввод: ("repl"|"media"|"btn", item_id) | ("ins", item_id, role) | ("time", set_id) | ("channel",)
+fwd: dict | None = None             # пересланный пост, из которого создаём набор
 view: tuple | None = None          # что показано на «экране»: ("menu",) ("draft", sid) ("list",) ("set", sid) ("item", iid) ("plan",) ("settings",)
 scr_id: int | None = None          # id сообщения-экрана
 tmp_ids: list[int] = []            # временные сообщения бота, которые убираем после использования
@@ -756,6 +757,28 @@ async def on_message(m: Message, bot: Bot):
             await render(bot, fresh=True)
         return
 
+    # пересланный пост (например, от партнёра) вне черновика: предлагаем сделать из него набор
+    if m.forward_origin and not (view and view[0] == "draft"):
+        data = extract(m)
+        if data is None:
+            await tmp(bot, "Этот тип сообщения не поддерживается. Отправь текст, фото, видео, гиф или файл.")
+            return
+        rows = getattr(getattr(m, "reply_markup", None), "inline_keyboard", None) or []
+        for row in rows:  # кнопка-ссылка партнёра переезжает вместе с постом
+            b = next((x for x in row if getattr(x, "url", None)), None)
+            if b:
+                data["btn_text"], data["btn_url"] = b.text[:60], b.url
+                break
+        global fwd
+        fwd = data
+        await clear_tmp(bot)
+        await tmp(bot, "Что сделать из этого поста?", Kb(inline_keyboard=[
+            [Btn(text="📝 Обычный пост", callback_data="fw:single")],
+            [Btn(text="🤝 Взаимный пиар", callback_data="fw:mutual")],
+            [Btn(text="🌙 Ночь", callback_data="fw:night")],
+            [Btn(text="Отмена", callback_data="cancel")]]))
+        return
+
     # обычное сообщение: добавляем в открытый черновик
     if view and view[0] == "draft":
         s = await db.get_set(view[1])
@@ -818,6 +841,18 @@ async def on_cb(c: CallbackQuery, bot: Bot):
         return
     if action in ("plan", "list"):
         await open_view(bot, (action,))
+        await c.answer()
+        return
+    if action == "fw":
+        global fwd
+        data, fwd = fwd, None
+        if not data:
+            await c.answer("Перешли пост ещё раз", show_alert=True)
+            return
+        await db.drop_empty_drafts()
+        sid = await db.new_set(parts[0])
+        await add_to_draft(bot, await db.get_set(sid), data, role="post")
+        await open_view(bot, ("draft", sid), fresh=True)
         await c.answer()
         return
     if action == "new":
