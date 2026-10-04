@@ -95,7 +95,7 @@ def plan_night(items: list[dict], start: datetime, gap: int, tz: ZoneInfo):
 
     anchor, p2_at, end = at(-1, 21), at(0, 0), at(0, 8)
     late = first_reminder_min > anchor
-    if late and r1 and p2_at - first_reminder_min < gap_td * len(r1):
+    if late and r1 and p2_at - first_reminder_min < g * len(r1):
         raise ValueError("late")
 
     def m1(nom: datetime) -> datetime:
