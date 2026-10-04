@@ -137,7 +137,8 @@ def extract(m: Message) -> dict | None:
         media_type, file_id = "document", m.document.file_id
     elif not m.text:
         return None
-    return {"text_html": (m.html_text or "") if (m.text or m.caption) else "", "media_type": media_type, "file_id": file_id}
+    return {"text_html": (m.html_text or "") if (m.text or m.caption) else "", "media_type": media_type, "file_id": file_id,
+            "src_chat": m.chat.id, "src_msg": m.message_id}
 
 
 def markup(it: dict) -> Kb | None:
@@ -148,6 +149,13 @@ def markup(it: dict) -> Kb | None:
 
 async def send_item(bot: Bot, chat, it: dict) -> list[int]:
     kb, text, mt, fid = markup(it), it["text_html"] or "", it["media_type"], it["file_id"]
+    if it.get("src_msg"):
+        # копируем исходное сообщение целиком: так сохраняются премиум-эмодзи и всё форматирование
+        try:
+            copied = await bot.copy_message(chat, it["src_chat"], it["src_msg"], reply_markup=kb)
+            return [copied.message_id]
+        except Exception as e:
+            logging.warning("copy_message failed, sending manually: %s", e)
     if not mt:
         return [(await bot.send_message(chat, text or "…", reply_markup=kb)).message_id]
     sender = {"photo": bot.send_photo, "video": bot.send_video, "animation": bot.send_animation,
@@ -683,7 +691,7 @@ async def on_message(m: Message, bot: Bot):
             if not data["media_type"]:
                 await tmp(bot, "Нужно фото, видео, гиф или файл.")
                 return
-            await db.upd_item(cur[1], media_type=data["media_type"], file_id=data["file_id"])
+            await db.upd_item(cur[1], media_type=data["media_type"], file_id=data["file_id"], src_chat=None, src_msg=None)
             await after_item_change(bot, cur[1], fresh=True)
         elif cur[0] == "repl":
             await db.upd_item(cur[1], **data)
@@ -880,7 +888,7 @@ async def on_cb(c: CallbackQuery, bot: Bot):
                 rows.insert(0, [Btn(text="🗑 Убрать медиа", callback_data=f"mx:{iid}")])
             await tmp(bot, "Отправь фото, видео, гиф или файл.", Kb(inline_keyboard=rows))
         elif action == "mx":
-            await db.upd_item(iid, media_type=None, file_id=None)
+            await db.upd_item(iid, media_type=None, file_id=None, src_chat=None, src_msg=None)
             await after_item_change(bot, iid)
         elif action == "bt":
             await clear_tmp(bot)
