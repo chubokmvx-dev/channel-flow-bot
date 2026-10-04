@@ -496,7 +496,9 @@ async def launch(bot: Bot, sid: int) -> str | None:
         start = start or n + timedelta(seconds=random.randint(lo, hi))
         try:
             plan, p2_at, end_at = planner.plan_night(items, start, g, TZ)
-        except ValueError:
+        except ValueError as e:
+            if str(e) == "cross":
+                return "Разогревы и пост 1 не успевают выйти до 00:00, поэтому ночь не запускаю и ничего не публикую. Поставь старт раньше или запусти после 00:00 (тогда это будет следующая ночь)."
             return "До 00:00 слишком мало времени для напоминаний первой части. Запусти раньше или поставь старт после 00:00 (тогда это будет следующая ночь)."
         await apply_plan(plan, items)
         await db.upd_set(sid, p2_at=p2_at, end_at=end_at)

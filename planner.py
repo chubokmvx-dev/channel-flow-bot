@@ -87,6 +87,9 @@ def plan_night(items: list[dict], start: datetime, gap: int, tz: ZoneInfo):
         t += g
     first_reminder_min = t  # A
 
+    # разогревы и пост 1 не должны пересекать полночь: тогда ночь не запускаем вообще
+    if last >= datetime.combine(start.astimezone(tz).date() + timedelta(days=1), dtime(0, 0), tzinfo=tz):
+        raise ValueError("cross")
     # полночь, в которую выйдет пост 2: ближайшая 00:00 после поста 1
     day = last.astimezone(tz).date() + timedelta(days=1)
 
