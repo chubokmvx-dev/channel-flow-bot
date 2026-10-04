@@ -1,6 +1,7 @@
 import asyncio
 import html
 import io
+import json
 import os
 import secrets
 import logging
@@ -87,7 +88,7 @@ def snip(it: dict, n: int = 28) -> str:
 
 
 def flags(it: dict) -> str:
-    return (" 📎" if it["media_type"] else "") + (" 🔗" if it["btn_url"] else "") + (
+    return (" 📎" if it["media_type"] else "") + (" 🔗" if get_btns(it) else "") + (
         " 🗑" if it["custom_ttl"] not in (None,) else "")
 
 
@@ -143,19 +144,64 @@ def extract(m: Message) -> dict | None:
         media_type, file_id = "document", m.document.file_id
     elif not m.text:
         return None
-    return {"text_html": (m.html_text or "") if (m.text or m.caption) else "", "media_type": media_type, "file_id": file_id,
+    btns = buttons_from_markup(getattr(m, "reply_markup", None))
+    d = {"text_html": (m.html_text or "") if (m.text or m.caption) else "", "media_type": media_type, "file_id": file_id,
             "src_chat": m.chat.id, "src_msg": m.message_id,
             "text_msg": m.message_id if (m.text or m.caption) else None,
             "media_msg": m.message_id if media_type else None,
             # ID сообщений в личке у бота и у пользователя разные, поэтому для userbot ищем по времени отправки
             "text_ts": int(m.date.timestamp()) if (m.text or m.caption) else None,
             "media_ts": int(m.date.timestamp()) if media_type else None}
+    if btns:  # кнопки есть только у пересланных постов; у обычных сообщений не затираем уже заданные
+        d["btns"] = json.dumps(btns, ensure_ascii=False)
+    return d
+
+
+STYLE_EMOJI = {"danger": "🔴", "success": "🟢", "primary": "🔵"}
+EMOJI_STYLE = {v: k for k, v in STYLE_EMOJI.items()}
+MAX_BTNS = 4
+
+
+def get_btns(it: dict) -> list[dict]:
+    """Кнопки-ссылки поста: [{text, url, style}], каждая в своём ряду."""
+    if it.get("btns"):
+        try:
+            return json.loads(it["btns"])
+        except ValueError:
+            return []
+    if it.get("btn_url"):
+        return [{"text": it["btn_text"], "url": it["btn_url"], "style": None}]
+    return []
+
+
+def parse_btns(text: str) -> list[dict] | None:
+    """Одна строка = одна кнопка: «[🔴|🔵|🟢] Текст - https://ссылка». None, если формат не понят."""
+    out = []
+    for line in [l.strip() for l in text.splitlines() if l.strip()]:
+        style = None
+        if line[0] in EMOJI_STYLE:
+            style, line = EMOJI_STYLE[line[0]], line[1:].strip()
+        mt = BTN_RE.match(line)
+        if not mt:
+            return None
+        out.append({"text": mt.group(1).strip()[:60], "url": mt.group(2), "style": style})
+    return out if 0 < len(out) <= MAX_BTNS else None
+
+
+def buttons_from_markup(rm) -> list[dict]:
+    out = []
+    for row in getattr(rm, "inline_keyboard", None) or []:
+        for b in row:
+            if getattr(b, "url", None):
+                out.append({"text": b.text[:60], "url": b.url, "style": getattr(b, "style", None)})
+    return out[:MAX_BTNS]
 
 
 def markup(it: dict) -> Kb | None:
-    if it["btn_url"]:
-        return Kb(inline_keyboard=[[Btn(text=it["btn_text"], url=it["btn_url"])]])
-    return None
+    btns = get_btns(it)
+    if not btns:
+        return None
+    return Kb(inline_keyboard=[[Btn(text=b["text"], url=b["url"], **({"style": b["style"]} if b.get("style") else {}))] for b in btns])
 
 
 HID_RE = re.compile(r'^\s*<a href="[^"]+">\u200b</a>')
@@ -383,8 +429,8 @@ async def v_item(iid: int):
     lines.append("")
     if it["media_type"]:
         lines.append("📎 Есть медиа")
-    if it["btn_url"]:
-        lines.append(f"🔗 {html.escape(it['btn_text'])} → {html.escape(it['btn_url'])}")
+    for b in get_btns(it):
+        lines.append(f"🔗 {STYLE_EMOJI.get(b.get('style'), '')}{html.escape(b['text'])} → {html.escape(b['url'])}")
     if it["status"] == "pending":
         lines.append(f"Выйдет: {fmt(it['send_at'], True)}")
     else:
@@ -594,7 +640,7 @@ async def publish(bot: Bot, ch, it: dict) -> tuple[list[int], str]:
         try:
             ids = await userbot.send(ch, it["text_ts"], it["media_ts"], plain(it["text_html"]),
                                      it["media_url"] if it["media_type"] == "photo" else None, hidden_preview(it))
-            if it["btn_url"]:
+            if get_btns(it):
                 try:  # кнопки-ссылки может добавить только бот; ему нужно право «Редактирование сообщений»
                     await bot.edit_message_reply_markup(chat_id=ch, message_id=ids[-1], reply_markup=markup(it))
                 except Exception as e:
@@ -756,11 +802,11 @@ async def on_message(m: Message, bot: Bot):
     if cur and cur[0] == "btn":
         t = (m.text or "").strip()
         if t.lower() in ("убрать", "-", "удалить"):
-            await db.upd_item(cur[1], btn_text=None, btn_url=None)
-        elif (mt := BTN_RE.match(t)):
-            await db.upd_item(cur[1], btn_text=mt.group(1).strip()[:60], btn_url=mt.group(2))
+            await db.upd_item(cur[1], btn_text=None, btn_url=None, btns=None)
+        elif (bl := parse_btns(t)):
+            await db.upd_item(cur[1], btn_text=None, btn_url=None, btns=json.dumps(bl, ensure_ascii=False))
         else:
-            await tmp(bot, "Формат: Текст кнопки - https://ссылка (или слово «убрать»).")
+            await tmp(bot, f"Не понял. Каждая кнопка с новой строки, до {MAX_BTNS} штук:\nТекст - https://ссылка\nЦвет можно задать значком в начале строки: 🔴 красная, 🔵 синяя, 🟢 зелёная.")
             return
         await after_item_change(bot, cur[1], fresh=True)
         return
@@ -813,12 +859,6 @@ async def on_message(m: Message, bot: Bot):
         if data is None:
             await tmp(bot, "Этот тип сообщения не поддерживается. Отправь текст, фото, видео, гиф или файл.")
             return
-        rows = getattr(getattr(m, "reply_markup", None), "inline_keyboard", None) or []
-        for row in rows:  # кнопка-ссылка партнёра переезжает вместе с постом
-            b = next((x for x in row if getattr(x, "url", None)), None)
-            if b:
-                data["btn_text"], data["btn_url"] = b.text[:60], b.url
-                break
         await host_photo(bot, data)
         global fwd
         fwd = data
@@ -1079,7 +1119,7 @@ async def on_cb(c: CallbackQuery, bot: Bot):
         elif action == "bt":
             await clear_tmp(bot)
             mode = ("btn", iid)
-            await tmp(bot, "Отправь кнопку в формате:\nТекст кнопки - https://ссылка\nИли слово «убрать».", cancel_kb)
+            await tmp(bot, f"Отправь кнопки: каждая с новой строки, до {MAX_BTNS} штук.\nТекст - https://ссылка\nЦвет задаётся значком в начале строки: 🔴 красная, 🔵 синяя, 🟢 зелёная (без значка обычная).\nПример:\n🔴 ЗАБРАТЬ ЭКСПРЕСС - https://t.me/...\n🔵 БЕСПЛАТНО - https://t.me/...\nИли слово «убрать».", cancel_kb)
         elif action == "rp":
             await clear_tmp(bot)
             mode = ("repl", iid)
