@@ -159,7 +159,8 @@ async def send_item(bot: Bot, chat, it: dict) -> list[int]:
     if it.get("src_msg"):
         # копируем исходное сообщение целиком: так сохраняются премиум-эмодзи и всё форматирование
         try:
-            copied = await bot.copy_message(chat, it["src_chat"], it["src_msg"], reply_markup=kb)
+            extra = {"show_caption_above_media": True} if mt in ("photo", "video", "animation") and text else {}
+            copied = await bot.copy_message(chat, it["src_chat"], it["src_msg"], reply_markup=kb, **extra)
             return [copied.message_id]
         except Exception as e:
             logging.warning("copy_message failed, sending manually: %s", e)
@@ -168,9 +169,10 @@ async def send_item(bot: Bot, chat, it: dict) -> list[int]:
     sender = {"photo": bot.send_photo, "video": bot.send_video, "animation": bot.send_animation,
               "document": bot.send_document}[mt]
     if len(text) <= 1024:
-        return [(await sender(chat, **{mt: fid}, caption=text or None, reply_markup=kb)).message_id]
-    first = await sender(chat, **{mt: fid})
-    second = await bot.send_message(chat, text, reply_markup=kb)
+        extra = {"show_caption_above_media": True} if mt in ("photo", "video", "animation") and text else {}
+        return [(await sender(chat, **{mt: fid}, caption=text or None, reply_markup=kb, **extra)).message_id]
+    first = await bot.send_message(chat, text)
+    second = await sender(chat, **{mt: fid}, reply_markup=kb)
     return [first.message_id, second.message_id]
 
 
@@ -1048,15 +1050,7 @@ async def on_cb(c: CallbackQuery, bot: Bot):
                 await db.upd_item(iid, delete_at=None)
             await after_item_change(bot, iid)
         elif action == "pv":
-            try:  # превью без пересборки: копируем исходные сообщения, эмодзи и форматирование остаются как есть
-                if it["media_msg"] and it["text_msg"] and it["text_msg"] != it["media_msg"]:
-                    a = await bot.copy_message(ADMIN, ADMIN, it["media_msg"])
-                    b = await bot.copy_message(ADMIN, ADMIN, it["text_msg"], reply_markup=markup(it))
-                    m = [a.message_id, b.message_id]
-                else:
-                    m = await send_item(bot, ADMIN, it)
-            except Exception:
-                m = await send_item(bot, ADMIN, it)
+            m = await send_item(bot, ADMIN, it)
             tmp_ids.extend(m)
             await tmp(bot, "Так выглядит пост.", Kb(inline_keyboard=[[Btn(text="✖️ Закрыть", callback_data="cancel")]]))
         elif action == "rm":
