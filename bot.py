@@ -642,12 +642,12 @@ async def launch(bot: Bot, sid: int) -> str | None:
         await db.upd_item(items[0]["id"], send_at=start, status="pending",
                           delete_at=start + timedelta(seconds=ttl) if ttl else None)
     elif s["kind"] == "mutual":
-        start = start or n + timedelta(seconds=random.randint(lo, hi))
+        start = planner.ceil_min(start or n + timedelta(seconds=random.randint(lo, hi)))
         await apply_plan(planner.plan_mutual(items, start, g, n), items)
     else:
         if not any(i["role"] == "post" and i["part"] == 1 for i in items):
             return "В ночи нужен хотя бы один пост."
-        start = start or n + timedelta(seconds=random.randint(lo, hi))
+        start = planner.ceil_min(start or n + timedelta(seconds=random.randint(lo, hi)))
         try:
             plan, p2_at, end_at = planner.plan_night(items, start, g, TZ)
         except ValueError as e:
@@ -874,7 +874,7 @@ async def worker(bot: Bot) -> None:
             await tick(bot)
         except Exception:
             logging.exception("tick failed")
-        await asyncio.sleep(3)
+        await asyncio.sleep(1)
 
 
 # ---------- команды и кнопки нижней клавиатуры ----------
@@ -1097,7 +1097,7 @@ async def finish_set_time(bot: Bot, sid: int, fresh: bool = False) -> None:
 # ---------- кнопки ----------
 
 def quick_times() -> list[tuple[str, int]]:
-    n = now()
+    n = now().replace(second=0, microsecond=0)
     out = [("через 15 мин", n + timedelta(minutes=15)), ("через 30 мин", n + timedelta(minutes=30)),
            ("через 1 час", n + timedelta(hours=1)), ("через 2 часа", n + timedelta(hours=2))]
     h = n.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)

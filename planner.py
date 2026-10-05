@@ -5,6 +5,16 @@ from zoneinfo import ZoneInfo
 _AUTO = object()
 
 
+def ceil_min(dt: datetime) -> datetime:
+    """Округление вверх до целой минуты: шаги выходят в 9:25, 9:27, а не в 9:24:41."""
+    base = dt.replace(second=0, microsecond=0)
+    return base if base == dt else base + timedelta(minutes=1)
+
+
+def round_min(dt: datetime) -> datetime:
+    return ceil_min(dt - timedelta(seconds=30))
+
+
 def _custom(it: dict, send_at: datetime):
     ttl = it.get("custom_ttl")
     if ttl is None:
@@ -21,10 +31,13 @@ def plan_mutual(items: list[dict], start: datetime, gap: int, now: datetime) -> 
     last_sent = None
     for it in items:
         if it["status"] in ("sent", "deleted") and it.get("sent_at"):
-            send[it["id"]] = it["sent_at"]
-            if last_sent is None or it["sent_at"] > last_sent:
-                last_sent = it["sent_at"]
-    cursor = max(last_sent + g, now) if last_sent else max(start, now)
+            # привязываемся к запланированному времени (9:25, 9:27…); фактическое берём, только если вышло с большим опозданием
+            planned = it.get("send_at")
+            at = planned if planned and it["sent_at"] - planned <= timedelta(seconds=60) else it["sent_at"]
+            send[it["id"]] = at
+            if last_sent is None or at > last_sent:
+                last_sent = at
+    cursor = ceil_min(max(last_sent + g, now) if last_sent else max(start, now))
     for it in items:
         if it["status"] in ("draft", "pending"):
             send[it["id"]] = cursor
@@ -90,6 +103,7 @@ def plan_night(items: list[dict], start: datetime, gap: int, tz: ZoneInfo):
     r2 = [i for i in items if i["role"] == "reminder" and i.get("part") == 2]
 
     send: dict[int, datetime] = {}
+    start = ceil_min(start)
     t = start
     last = start
     for it in warm + [p1]:
@@ -116,7 +130,7 @@ def plan_night(items: list[dict], start: datetime, gap: int, tz: ZoneInfo):
         """Напоминания части 1: если запуск поздний, равномерно сжимаем между первым возможным моментом и 00:00."""
         if not late:
             return nom
-        return first_reminder_min + (p2_at - first_reminder_min) * ((nom - anchor) / (p2_at - anchor))
+        return round_min(first_reminder_min + (p2_at - first_reminder_min) * ((nom - anchor) / (p2_at - anchor)))
 
     for i, it in enumerate(r1):
         send[it["id"]] = m1(at(-1, 21 + i))
