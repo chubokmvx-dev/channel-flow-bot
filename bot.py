@@ -762,12 +762,22 @@ async def _publish(bot: Bot, ch, it: dict) -> tuple[list[int], str]:
     """Публикует в канал. Если подключён userbot, то от имени аккаунта владельца (работают премиум-эмодзи)."""
     if userbot.enabled() and (it["text_ts"] or it["media_ts"] or it.get("plain") is not None):
         try:
+            t0 = time.monotonic()
             ids = await userbot.send(ch, it["text_ts"], it["media_ts"], plain(it["text_html"]),
                                      it["media_url"] if it["media_type"] == "photo" else None, hidden_preview(it),
                                      it.get("plain"), it.get("ents"))
+            t1 = time.monotonic()
             if get_btns(it):
                 try:  # кнопки-ссылки может добавить только бот; ему нужно право «Редактирование сообщений»
-                    await bot.edit_message_reply_markup(chat_id=ch, message_id=ids[-1], reply_markup=markup(it))
+                    for attempt in range(3):
+                        try:
+                            await bot.edit_message_reply_markup(chat_id=ch, message_id=ids[-1], reply_markup=markup(it))
+                            break
+                        except TelegramBadRequest as e:
+                            if attempt == 2 or "not found" not in str(e).lower():
+                                raise
+                            await asyncio.sleep(0.4)  # бот ещё не «увидел» сообщение аккаунта
+                    logging.warning("TIMING item=%s send=%.2fs buttons=%.2fs", it["id"], t1 - t0, time.monotonic() - t1)
                 except Exception as e:
                     await notify(bot, f"⚠️ Пост вышел, но кнопку добавить не удалось: {html.escape(str(e))}\n"
                                       "Включи боту в канале право «Редактирование сообщений».")
@@ -800,28 +810,30 @@ async def snapshot(ch, it: dict, kind: str) -> None:
             await db.save_snap(it["id"], kind, -1, 0, 0, 0)
 
 
+async def delete_item(bot: Bot, ch, it: dict) -> None:
+    await snapshot_final(ch, it)  # быстрый снимок просмотров перед удалением, остальное (вступления, закрытие ссылок) в фоне
+    try:
+        if ch and it["ch_msg_ids"]:
+            ids = [int(x) for x in it["ch_msg_ids"].split(",")]
+            if it.get("via") == "user" and userbot.enabled():
+                try:
+                    await userbot.delete(ch, ids)
+                except Exception as e:
+                    logging.warning("userbot delete failed: %s", e)
+            else:
+                for mid in ids:
+                    try:
+                        await bot.delete_message(ch, mid)
+                    except Exception as e:
+                        logging.warning("delete failed: %s", e)
+    finally:
+        logging.warning("DELETED item=%s set=%s role=%s ids=%s", it["id"], it["set_id"], it["role"], it["ch_msg_ids"])
+        await db.upd_item(it["id"], status="deleted", delete_at=None)
+
+
 async def tick(bot: Bot) -> None:
     ch = await channel()
-    for it in await db.due_deletions():
-        await snapshot_final(ch, it)  # быстрый снимок просмотров перед удалением, остальное (вступления, закрытие ссылок) в фоне
-        try:
-            if ch and it["ch_msg_ids"]:
-                ids = [int(x) for x in it["ch_msg_ids"].split(",")]
-                if it.get("via") == "user" and userbot.enabled():
-                    try:
-                        await userbot.delete(ch, ids)
-                    except Exception as e:
-                        logging.warning("userbot delete failed: %s", e)
-                else:
-                    for mid in ids:
-                        try:
-                            await bot.delete_message(ch, mid)
-                        except Exception as e:
-                            logging.warning("delete failed: %s", e)
-        finally:
-            logging.warning("DELETED item=%s set=%s role=%s ids=%s", it["id"], it["set_id"], it["role"], it["ch_msg_ids"])
-            await db.upd_item(it["id"], status="deleted", delete_at=None)
-    if ch:
+    if ch:  # сначала публикации: новый шаг не должен ждать удалений
         for it in await db.due_sends():
             try:
                 ids, via = await publish(bot, ch, it)
@@ -834,6 +846,9 @@ async def tick(bot: Bot) -> None:
                 await db.upd_item(it["id"], status="failed")
                 await notify(bot, f"❌ Не удалось опубликовать «{html.escape(plain(it['text_html'])[:30])}»: {html.escape(str(e))}\n"
                                   "Проверь, что бот админ канала с правом публиковать сообщения.")
+    due = await db.due_deletions()
+    if due:
+        await asyncio.gather(*[delete_item(bot, ch, it) for it in due], return_exceptions=True)
     for sid in await db.unfinished_sets():
         await schedule_repeat(bot, sid)  # сначала следующий повтор, потом закрываем этот: при сбое не потеряем серию
         await db.upd_set(sid, status="done")  # без сообщения: оно поднимало чат с ботом выше канала
