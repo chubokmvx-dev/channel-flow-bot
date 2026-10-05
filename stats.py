@@ -94,7 +94,7 @@ def build_report(rows: list[dict], tz: ZoneInfo, days: int) -> tuple[str, list[s
     tracked = [r for r in items if r.get("tracked")]
     joins_total = sum(r["joins"] for r in tracked)
     if tracked:
-        lines += ["", "<b>🔗 Вступления по кнопкам-приглашениям:</b>", f"Отслеживается сообщений: {len(tracked)}, всего вступлений/заявок: {joins_total}"]
+        lines += ["", "<b>🔗 Вступления по кнопкам-приглашениям</b> (по общей ссылке считаются приблизительно: если рядом идут другие посты, вступления могут учитываться в обоих):", f"Отслеживается сообщений: {len(tracked)}, всего вступлений/заявок: {joins_total}"]
         views = sum(r["views"] for r in tracked)
         if views:
             lines.append(f"Конверсия: {joins_total / views * 100:.2f}% от просмотров")

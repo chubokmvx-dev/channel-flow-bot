@@ -522,8 +522,11 @@ async def v_settings():
     text = (f"<b>Настройки</b>\n\n📣 Канал: {html.escape(title)}\n⏱ Пауза между шагами: {g // 60} мин\n"
             f"⏳ Старт после запуска: {lo // 60}–{hi // 60} мин\n🕐 Часовой пояс: {config.TIMEZONE}\n"
             f"👤 Публикация от твоего аккаунта (премиум-эмодзи): {'включена' if userbot.enabled() else 'выключена'}")
+    lm = (await db.get_setting("link_mode", "shared")) == "unique"
+    text += "\n🔗 Ссылки-приглашения в кнопках: " + ("своя для каждого сообщения (точный счёт вступлений)" if lm else "ваша ссылка как есть (вступления считаются приблизительно)")
     kb = Kb(inline_keyboard=[
         [Btn(text="📣 Выбрать канал", callback_data="cfg:channel")],
+        [Btn(text="🔗 Ссылки: " + ("→ как есть" if lm else "→ уникальные"), callback_data="cfg:links")],
         [Btn(text=("✓ " if g == v else "") + f"{v // 60} мин", callback_data=f"cfg:gap:{v}") for v in (60, 120, 180, 300)],
         [Btn(text=("✓ " if (lo, hi) == (a, b) else "") + f"{a // 60}–{b // 60} мин", callback_data=f"cfg:start:{a}:{b}")
          for a, b in ((0, 60), (120, 300), (300, 600))],
@@ -678,14 +681,15 @@ async def with_tracking(it: dict) -> dict:
     if not btns or not userbot.enabled():
         return it
     track, out = [], []
+    unique = (await db.get_setting("link_mode", "shared")) == "unique"
     for b in btns:
         t = None
         try:
-            t = await userbot.track_link(b["url"], f"бот {it['id']} {now().strftime('%d.%m %H:%M')}")
+            t = await userbot.track_link(b["url"], f"бот {it['id']} {now().strftime('%d.%m %H:%M')}", unique)
         except Exception as e:
             logging.warning("track_link failed: %s", e)
         if t:
-            track.append({"link": t["link"], "chat": t["chat"], "orig": b["url"]})
+            track.append({**t, "orig": b["url"]})
             out.append({**b, "url": t["link"]})
         else:
             out.append(b)
@@ -1087,6 +1091,10 @@ async def on_cb(c: CallbackQuery, bot: Bot):
             mode = ("channel",)
             await tmp(bot, "Перешли мне любой пост из канала (или отправь @username / ID канала). Бот должен быть админом канала.",
                       Kb(inline_keyboard=[[Btn(text="Отмена", callback_data="cancel")]]))
+        elif parts[0] == "links":
+            cur = await db.get_setting("link_mode", "shared")
+            await db.set_setting("link_mode", "shared" if cur == "unique" else "unique")
+            await render(bot)
         elif parts[0] == "gap":
             await db.set_setting("gap", parts[1])
             await render(bot)

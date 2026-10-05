@@ -156,8 +156,8 @@ INV_RE = re.compile(r"t\.me/(?:\+|joinchat/)([\w-]+)")
 _hash_cache: dict = {}
 
 
-async def track_link(url: str, title: str) -> dict | None:
-    """Если ссылка-приглашение создана этим аккаунтом, делаем для поста отдельную копию с теми же настройками и считаем по ней вступления."""
+async def _info(url: str):
+    """(peer, request_needed, chat_id) для ссылки-приглашения, созданной этим аккаунтом; иначе None."""
     m = INV_RE.search(url or "")
     if not m:
         return None
@@ -174,10 +174,21 @@ async def track_link(url: str, title: str) -> dict | None:
         except Exception as e:
             logging.info("track_link: ссылка не отслеживается (%s): %s", h, e)
         _hash_cache[h] = info
-    info = _hash_cache[h]
+    return _hash_cache[h] or None
+
+
+async def track_link(url: str, title: str, unique: bool = False) -> dict | None:
+    """Ссылка-приглашение, созданная этим аккаунтом, отслеживается.
+    unique=False: остаётся ваша ссылка как есть, запоминаем её счётчик на момент публикации (вступления считаем разницей);
+    unique=True: для сообщения создаётся своя копия ссылки, считаем точно."""
+    info = await _info(url)
     if not info:
         return None
     peer, req, chat_id = info
+    if not unique:
+        inv = await _invite(chat_id, url)
+        return {"link": url, "chat": chat_id, "shared": True,
+                "base": (getattr(inv, "usage", 0) or 0) + (getattr(inv, "requested", 0) or 0)}
     inv = await client(functions.messages.ExportChatInviteRequest(peer=peer, request_needed=req, title=title[:32]))
     return {"link": inv.link, "chat": chat_id}
 
@@ -192,12 +203,15 @@ async def joins(track: list[dict]) -> int:
     total = 0
     for t in track:
         inv = await _invite(t["chat"], t["link"])
-        total += (getattr(inv, "usage", 0) or 0) + (getattr(inv, "requested", 0) or 0)
+        cur = (getattr(inv, "usage", 0) or 0) + (getattr(inv, "requested", 0) or 0)
+        total += max(0, cur - t["base"]) if t.get("shared") else cur
     return total
 
 
 async def revoke(track: list[dict]) -> None:
     for t in track:
+        if t.get("shared"):
+            continue  # общую ссылку пользователя никогда не закрываем
         try:
             peer = await _chan(t["chat"])
             await client(functions.messages.EditExportedChatInviteRequest(peer=peer, link=t["link"], revoked=True))
