@@ -85,7 +85,7 @@ def plain(text_html: str) -> str:
 def snip(it: dict, n: int = 28) -> str:
     t = plain(it["text_html"]).replace("\n", " ").strip()
     if not t:
-        t = {"photo": "фото", "video": "видео", "animation": "гиф", "document": "файл"}.get(it["media_type"], "…")
+        t = {"photo": "фото", "video": "видео", "animation": "гиф", "voice": "голосовое", "audio": "аудио", "document": "файл"}.get(it["media_type"], "…")
     return html.escape(t[:n] + ("…" if len(t) > n else ""))
 
 
@@ -142,6 +142,10 @@ def extract(m: Message) -> dict | None:
         media_type, file_id = "video", m.video.file_id
     elif m.animation:
         media_type, file_id = "animation", m.animation.file_id
+    elif m.voice:
+        media_type, file_id = "voice", m.voice.file_id
+    elif m.audio:
+        media_type, file_id = "audio", m.audio.file_id
     elif m.document:
         media_type, file_id = "document", m.document.file_id
     elif not m.text:
@@ -258,7 +262,7 @@ async def send_item(bot: Bot, chat, it: dict) -> list[int]:
     if not mt:
         opts = LinkPreviewOptions(is_disabled=False, prefer_large_media=True) if hidden_preview(it) else LinkPreviewOptions(is_disabled=True)
         return [(await bot.send_message(chat, text or "…", reply_markup=kb, link_preview_options=opts)).message_id]
-    sender = {"photo": bot.send_photo, "video": bot.send_video, "animation": bot.send_animation,
+    sender = {"photo": bot.send_photo, "video": bot.send_video, "animation": bot.send_animation, "voice": bot.send_voice, "audio": bot.send_audio,
               "document": bot.send_document}[mt]
     if len(text) <= 1024:
         extra = {"show_caption_above_media": True} if mt in ("photo", "video", "animation") and text else {}
@@ -675,19 +679,25 @@ async def notify(bot: Bot, text: str) -> None:
         logging.exception("notify failed")
 
 
-async def with_tracking(it: dict) -> dict:
-    """Кнопки-приглашения заменяем на уникальные ссылки этого сообщения, чтобы считать вступления."""
+async def with_tracking(it: dict, replace: bool = True) -> dict:
+    """Кнопки-приглашения: считаем вступления. replace=True подставляет уникальные ссылки (нужно до публикации),
+    иначе только запоминаем счётчик ваших ссылок (можно в фоне, публикацию не задерживает)."""
     btns = get_btns(it)
     if not btns or not userbot.enabled():
         return it
-    track, out = [], []
     unique = (await db.get_setting("link_mode", "shared")) == "unique"
-    for b in btns:
-        t = None
+    title = f"бот {it['id']} {now().strftime('%d.%m %H:%M')}"
+
+    async def one(b):
         try:
-            t = await userbot.track_link(b["url"], f"бот {it['id']} {now().strftime('%d.%m %H:%M')}", unique)
+            return await userbot.track_link(b["url"], title, unique)
         except Exception as e:
             logging.warning("track_link failed: %s", e)
+            return None
+
+    res = await asyncio.gather(*[one(b) for b in btns])
+    track, out = [], []
+    for b, t in zip(btns, res):
         if t:
             track.append({**t, "orig": b["url"]})
             out.append({**b, "url": t["link"]})
@@ -696,12 +706,30 @@ async def with_tracking(it: dict) -> dict:
     if not track:
         return it
     await db.upd_item(it["id"], track=json.dumps(track))
-    return {**it, "btns": json.dumps(out, ensure_ascii=False)}
+    return {**it, "btns": json.dumps(out, ensure_ascii=False)} if replace else it
+
+
+_bg: set = set()
+
+
+def spawn(coro) -> None:
+    t = asyncio.create_task(coro)
+    _bg.add(t)
+    t.add_done_callback(_bg.discard)
 
 
 async def publish(bot: Bot, ch, it: dict) -> tuple[list[int], str]:
+    unique = (await db.get_setting("link_mode", "shared")) == "unique"
+    if unique:
+        it = await with_tracking(it, True)  # уникальные ссылки нужны до публикации
+    res = await _publish(bot, ch, it)
+    if not unique and get_btns(it):
+        spawn(with_tracking(it, False))  # ваши ссылки остаются как есть: счётчик запоминаем уже в фоне, пост не ждёт
+    return res
+
+
+async def _publish(bot: Bot, ch, it: dict) -> tuple[list[int], str]:
     """Публикует в канал. Если подключён userbot, то от имени аккаунта владельца (работают премиум-эмодзи)."""
-    it = await with_tracking(it)
     if userbot.enabled() and (it["text_ts"] or it["media_ts"] or it.get("plain") is not None):
         try:
             ids = await userbot.send(ch, it["text_ts"], it["media_ts"], plain(it["text_html"]),
@@ -745,10 +773,7 @@ async def snapshot(ch, it: dict, kind: str) -> None:
 async def tick(bot: Bot) -> None:
     ch = await channel()
     for it in await db.due_deletions():
-        await snapshot(ch, it, "final")  # цифры за минуту до удаления: потом поста уже не будет
-        if it.get("track") and userbot.enabled():
-            await userbot.revoke(json.loads(it["track"]))  # старые ссылки закрываем: у админа лимит активных приглашений
-            await db.upd_item(it["id"], track_done=True)
+        await snapshot_final(ch, it)  # быстрый снимок просмотров перед удалением, остальное (вступления, закрытие ссылок) в фоне
         try:
             if ch and it["ch_msg_ids"]:
                 ids = [int(x) for x in it["ch_msg_ids"].split(",")]
@@ -777,14 +802,6 @@ async def tick(bot: Bot) -> None:
                 await db.upd_item(it["id"], status="failed")
                 await notify(bot, f"❌ Не удалось опубликовать «{html.escape(plain(it['text_html'])[:30])}»: {html.escape(str(e))}\n"
                                   "Проверь, что бот админ канала с правом публиковать сообщения.")
-    if userbot.enabled() and ch:
-        for it in await db.due_snaps():
-            await snapshot(ch, it, it["kind"])
-    if userbot.enabled() and time.time() - _last_sweep[0] > 600:
-        _last_sweep[0] = time.time()
-        for it in await db.stale_tracks():  # посты без таймера удаления: ссылки закрываем через 3 дня
-            await userbot.revoke(json.loads(it["track"]))
-            await db.upd_item(it["id"], track_done=True)
     for sid in await db.unfinished_sets():
         await schedule_repeat(bot, sid)  # сначала следующий повтор, потом закрываем этот: при сбое не потеряем серию
         await db.upd_set(sid, status="done")  # без сообщения: оно поднимало чат с ботом выше канала
@@ -805,6 +822,50 @@ async def schedule_repeat(bot: Bot, sid: int) -> None:
     if err:
         await db.upd_set(new_id, status="cancelled")
         await notify(bot, f"⚠️ Повтор «{KIND[s['kind']]}» на {fmt(nxt, True)} не поставлен: {html.escape(err)}")
+
+
+async def snapshot_final(ch, it: dict) -> None:
+    if not (userbot.enabled() and ch and it.get("ch_msg_ids")):
+        return
+    try:
+        st = await asyncio.wait_for(userbot.stats(ch, int(str(it["ch_msg_ids"]).split(",")[0]), None), 5)
+    except Exception as e:
+        logging.warning("final snapshot failed: %s", e)
+        st = None
+    spawn(finish_final(it, st))
+
+
+async def finish_final(it: dict, st: dict | None) -> None:
+    track = json.loads(it["track"]) if it.get("track") else None
+    try:
+        j = await userbot.joins(track) if track else 0
+    except Exception as e:
+        logging.info("joins failed: %s", e)
+        j = 0
+    if st:
+        await db.save_snap(it["id"], "final", st["views"], st["forwards"], st["reactions"], st["replies"], j)
+    if track:
+        await userbot.revoke(track)  # уникальные ссылки закрываем: у админа лимит активных приглашений (общие не трогаем)
+        await db.upd_item(it["id"], track_done=True)
+
+
+async def snap_worker(bot: Bot) -> None:
+    """Снимки через час/6 часов/сутки и уборка ссылок живут отдельно от публикаций: не задерживают их."""
+    last_sweep = 0.0
+    while True:
+        try:
+            ch = await channel()
+            if userbot.enabled() and ch:
+                for it in await db.due_snaps():
+                    await snapshot(ch, it, it["kind"])
+                if time.time() - last_sweep > 600:
+                    last_sweep = time.time()
+                    for it in await db.stale_tracks():
+                        await userbot.revoke(json.loads(it["track"]))
+                        await db.upd_item(it["id"], track_done=True)
+        except Exception:
+            logging.exception("snap_worker failed")
+        await asyncio.sleep(20)
 
 
 async def worker(bot: Bot) -> None:
@@ -1337,6 +1398,7 @@ async def main() -> None:
         if s["status"] == "scheduled":
             await replan(s["id"])
     asyncio.create_task(worker(bot))
+    asyncio.create_task(snap_worker(bot))
     await bot.delete_webhook(drop_pending_updates=False)
     await dp.start_polling(bot)
 

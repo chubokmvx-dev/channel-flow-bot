@@ -133,6 +133,9 @@ async def send(ch, text_ts: int | None, media_ts: int | None, text_plain: str = 
         if not mm:
             raise RuntimeError("исходное сообщение в чате с ботом не найдено (удалено или слишком старое?)")
         if len(text) <= 1024:
+            if mm.voice or mm.audio:  # голосовые и аудио: подпись обычная, без «над медиа»
+                m = await client.send_file(peer, mm.media, caption=text or None, formatting_entities=ents)
+                return [m.id]
             try:
                 m = await client.send_file(peer, mm.media, caption=text or None, formatting_entities=ents, invert_media=True)
             except TypeError:  # старая версия Telethon без invert_media
