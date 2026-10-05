@@ -47,9 +47,8 @@ BTN_RE = re.compile(r"^(.+?)\s*(?:\s[-–—]\s|\|)\s*((?:https?|tg)://\S+)$", r
 
 MAIN_KB = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="Создать пост"), KeyboardButton(text="Контент-план")],
-        [KeyboardButton(text="Изменить пост"), KeyboardButton(text="Статистика")],
-        [KeyboardButton(text="Настройки")],
+        [KeyboardButton(text="Создать пост"), KeyboardButton(text="Контент-план"), KeyboardButton(text="Изменить пост")],
+        [KeyboardButton(text="Статистика"), KeyboardButton(text="Настройки")],
     ],
     resize_keyboard=True,
     is_persistent=True,
@@ -404,20 +403,20 @@ async def v_draft(sid: int):
         lines.append("🕐 Старт: сразу" if s["kind"] == "single" else f"🕐 Старт: через {lo // 60}–{hi // 60} мин после запуска")
     rows = []
     if s["kind"] != "single":
-        rows.append([Btn(text=("✓ " if s["next_role"] == r else "") + ROLE[r], callback_data=f"nr:{sid}:{r}") for r in ROLES])
+        rows.append([Btn(text=f"Следующее: {nr_label} ⟳", callback_data=f"nc:{sid}")])
     if items:
         last = items[-1]["id"]
         rows.append([Btn(text="✏️ Текст", callback_data=f"tx:{last}"), Btn(text="📎 Медиа", callback_data=f"md:{last}"),
-                     Btn(text="🔗 Кнопка", callback_data=f"bt:{last}"), Btn(text="🗑 Таймер", callback_data=f"tm:{last}")])
-        extra = [Btn(text="👁 Предпросмотр", callback_data=f"pv:{last}")]
+                     Btn(text="🔗 Кнопки", callback_data=f"bt:{last}"), Btn(text="🗑 Таймер", callback_data=f"tm:{last}")])
+        extra = [Btn(text="👁 Просмотр", callback_data=f"pv:{last}")]
         if s["kind"] != "single":
-            extra.insert(0, Btn(text="↩️ Убрать последнее", callback_data=f"rl:{sid}"))
+            extra.append(Btn(text="↩️ Убрать последнее", callback_data=f"rl:{sid}"))
         rows.append(extra)
     go = ("✅ Запланировать" if s["start_at"] else "🚀 Опубликовать") if s["kind"] == "single" else "🚀 Запустить"
-    lines.append("🔁 Повтор: " + (REPEAT[s["repeat"]] if s["repeat"] else "нет"))
-    rows.append([Btn(text=("✓ " if (s["repeat"] or "none") == k else "") + t, callback_data=f"rep:{sid}:{k}")
-                 for k, t in (("none", "Без повтора"), ("daily", "День"), ("weekly", "Неделя"), ("monthly", "Месяц"))])
-    rows.append([Btn(text="🕐 Время", callback_data=f"tp:{sid}"), Btn(text=go, callback_data=f"go:{sid}")])
+    when = fmt(s["start_at"], True) if s["start_at"] else "сразу"
+    rows.append([Btn(text=f"🕐 {when}", callback_data=f"tp:{sid}"),
+                 Btn(text="🔁 " + (REPEAT[s["repeat"]] if s["repeat"] else "без повтора"), callback_data=f"rc:{sid}")])
+    rows.append([Btn(text=go, callback_data=f"go:{sid}")])
     rows.append([Btn(text="❌ Отмена", callback_data=f"x:{sid}")])
     return "\n".join(lines), Kb(inline_keyboard=rows)
 
@@ -458,31 +457,36 @@ async def v_set(sid: int):
         return await v_list()
     items = await db.items_of(sid)
     lines = [f"<b>{KIND[s['kind']]}</b>" + (" · ⏸ на паузе" if s["paused"] else "") + (f" · 🔁 {REPEAT[s['repeat']]}" if s["repeat"] else ""), ""]
-    kb = []
+    nums, n = [], 0
     has_pending = any(i["status"] == "pending" for i in items)
     for it in items:
         if it["status"] == "pending":
-            lines.append(f"▫️ {fmt(it['send_at'])} {label(it, s['kind'])}: {snip(it)}{flags(it)}")
-            kb.append([Btn(text=f"{fmt(it['send_at'])} {label(it, s['kind'])}: {plain(it['text_html'])[:18] or '…'}", callback_data=f"it:{it['id']}")])
+            n += 1
+            nums.append(Btn(text=str(n), callback_data=f"it:{it['id']}"))
+            lines.append(f"{n}. ▫️ {fmt(it['send_at'])} {label(it, s['kind'])}: {snip(it)}{flags(it)}")
         elif it["status"] == "sent":
             d = f", удалится {fmt(it['delete_at'])}" if it["delete_at"] else ""
-            lines.append(f"✅ {fmt(it['sent_at'])} {label(it, s['kind'])}: {snip(it)}{d}")
             if it["delete_at"]:
-                kb.append([Btn(text=f"✅ {fmt(it['sent_at'])} {label(it, s['kind'])} (в канале)", callback_data=f"it:{it['id']}")])
+                n += 1
+                nums.append(Btn(text=str(n), callback_data=f"it:{it['id']}"))
+            lines.append(f"{str(n) + '. ' if it['delete_at'] else ''}✅ {fmt(it['sent_at'])} {label(it, s['kind'])}: {snip(it)}{d}")
         elif it["status"] == "deleted":
             lines.append(f"▪️ {fmt(it['sent_at'])} {label(it, s['kind'])}: удалено")
         elif it["status"] == "failed":
             lines.append(f"❌ {label(it, s['kind'])}: не опубликовано")
-    kb = kb[:28]
-    if has_pending and not any(i["status"] in ("sent", "deleted") for i in items):
-        kb.insert(0, [Btn(text="🕐 Изменить время", callback_data=f"tp:{sid}")])
+    if nums:
+        lines += ["", "Нажми номер, чтобы изменить сообщение:"]
+    kb = [nums[i:i + 6] for i in range(0, min(len(nums), 30), 6)]
+    ctl = []
     if has_pending:
-        kb.insert(0, [Btn(text="▶️ Продолжить" if s["paused"] else "⏸ Пауза", callback_data=f"pz:{sid}")])
         if not s["paused"]:
-            kb.insert(0, [Btn(text="⏩ Следующее сейчас", callback_data=f"nw:{sid}"),
-                          Btn(text="⏭ Пропустить", callback_data=f"sk:{sid}")])
-    kb.append([Btn(text="⏹ Остановить", callback_data=f"stop:{sid}"), Btn(text="⏹🗑 Остановить и удалить из канала", callback_data=f"stopdel:{sid}")])
-    kb.append([Btn(text="◀️ Назад", callback_data="list")])
+            ctl += [Btn(text="⏩ Сейчас", callback_data=f"nw:{sid}"), Btn(text="⏭ Пропуск", callback_data=f"sk:{sid}")]
+        ctl.append(Btn(text="▶️ Дальше" if s["paused"] else "⏸ Пауза", callback_data=f"pz:{sid}"))
+    if ctl:
+        kb.insert(0, ctl)
+    if has_pending and not any(i["status"] in ("sent", "deleted") for i in items):
+        kb.insert(1 if ctl else 0, [Btn(text="🕐 Изменить время", callback_data=f"tp:{sid}")])
+    kb.append([Btn(text="⏹ Остановить…", callback_data=f"sx:{sid}"), Btn(text="◀️ Назад", callback_data="list")])
     return "\n".join(lines[:60]), Kb(inline_keyboard=kb)
 
 
@@ -507,14 +511,12 @@ async def v_item(iid: int):
     lines.append("Удаление: " + (f"{fmt(it['delete_at'], True)}" + (" (по таймеру)" if ttl else "") if it["delete_at"] else "не удаляется"))
     rows = []
     if it["status"] == "pending":
-        rows.append([Btn(text="✏️ Текст", callback_data=f"tx:{iid}"), Btn(text="📎 Медиа", callback_data=f"md:{iid}")])
-        rows.append([Btn(text="🔗 Кнопка", callback_data=f"bt:{iid}"), Btn(text="🗑 Таймер", callback_data=f"tm:{iid}")])
-        rows.append([Btn(text="🔁 Заменить всё сообщение", callback_data=f"rp:{iid}")])
+        rows.append([Btn(text="✏️ Текст", callback_data=f"tx:{iid}"), Btn(text="📎 Медиа", callback_data=f"md:{iid}"),
+                     Btn(text="🔗 Кнопки", callback_data=f"bt:{iid}"), Btn(text="🗑 Таймер", callback_data=f"tm:{iid}")])
         if s["kind"] == "mutual":
-            rows.append([Btn(text="⬆️ Выше", callback_data=f"up:{iid}"), Btn(text="⬇️ Ниже", callback_data=f"dn:{iid}")])
-            rows.append([Btn(text="➕ Вставить после:", callback_data="noop")])
-            rows.append([Btn(text=ROLE[r], callback_data=f"in:{iid}:{r}") for r in ROLES])
-        rows.append([Btn(text="❌ Убрать из очереди", callback_data=f"rm:{iid}")])
+            rows.append([Btn(text="⬆️", callback_data=f"up:{iid}"), Btn(text="⬇️", callback_data=f"dn:{iid}"),
+                         Btn(text="➕ Вставить", callback_data=f"im:{iid}")])
+        rows.append([Btn(text="🔁 Заменить", callback_data=f"rp:{iid}"), Btn(text="❌ Убрать", callback_data=f"rm:{iid}")])
     else:
         rows.append([Btn(text="🗑 Таймер", callback_data=f"tm:{iid}"), Btn(text="🗑 Удалить из канала сейчас", callback_data=f"dl:{iid}")])
     rows.append([Btn(text="👁 Показать", callback_data=f"pv:{iid}"), Btn(text="◀️ Назад", callback_data=f"set:{it['set_id']}")])
@@ -1234,6 +1236,21 @@ async def on_cb(c: CallbackQuery, bot: Bot):
         await open_view(bot, None)
         await c.answer("Отменено")
         return
+    if action == "nc":
+        sid = int(parts[0])
+        cur = (await db.get_set(sid))["next_role"]
+        await db.upd_set(sid, next_role=ROLES[(ROLES.index(cur) + 1) % len(ROLES)])
+        await render(bot)
+        await c.answer()
+        return
+    if action == "rc":
+        sid = int(parts[0])
+        cur = (await db.get_set(sid))["repeat"]
+        order = [None, "daily", "weekly", "monthly"]
+        await db.upd_set(sid, repeat=order[(order.index(cur) + 1) % 4])
+        await render(bot)
+        await c.answer()
+        return
     if action == "rep":
         sid, k = int(parts[0]), parts[1]
         await db.upd_set(sid, repeat=None if k == "none" else k)
@@ -1322,6 +1339,21 @@ async def on_cb(c: CallbackQuery, bot: Bot):
             await c.answer("Шаг пропущен")
         await open_view(bot, ("set", sid))
         return
+    if action == "im":
+        await clear_tmp(bot)
+        await tmp(bot, "Какое сообщение вставить сразу после этого?", Kb(inline_keyboard=[
+            [Btn(text=ROLE[r], callback_data=f"in:{parts[0]}:{r}") for r in ROLES], [Btn(text="Отмена", callback_data="cancel")]]))
+        await c.answer()
+        return
+    if action == "sx":
+        sid = int(parts[0])
+        await clear_tmp(bot)
+        await tmp(bot, "Остановить набор. Что сделать с тем, что уже вышло в канал?", Kb(inline_keyboard=[
+            [Btn(text="⏹ Остановить, оставить в канале", callback_data=f"stop:{sid}")],
+            [Btn(text="⏹🗑 Остановить и удалить из канала", callback_data=f"stopdel:{sid}")],
+            [Btn(text="Отмена", callback_data="cancel")]]))
+        await c.answer()
+        return
     if action in ("stop", "stopdel"):
         sid = int(parts[0])
         items = await db.items_of(sid)
@@ -1331,6 +1363,7 @@ async def on_cb(c: CallbackQuery, bot: Bot):
             elif it["status"] == "sent":
                 await db.upd_item(it["id"], delete_at=now() if action == "stopdel" else None)
         await db.upd_set(sid, status="cancelled")
+        await clear_tmp(bot)
         await open_view(bot, ("list",))
         await c.answer("Остановлено")
         return
