@@ -93,6 +93,13 @@ def entities_from_json(raw: str | None) -> list:
     return out
 
 
+async def prewarm(url: str) -> None:
+    try:
+        await client(functions.messages.GetWebPageRequest(url=url, hash=0))
+    except Exception as e:
+        logging.info("prewarm failed: %s", e)
+
+
 async def _send_framed(peer, text: str, ents, url: str) -> int:
     """Текст + картинка как большой предпросмотр ссылки под текстом (скрытая ссылка на картинку в начале поста)."""
     shifted = []
@@ -101,9 +108,17 @@ async def _send_framed(peer, text: str, ents, url: str) -> int:
         e2.offset += 1  # впереди добавляем один невидимый символ
         shifted.append(e2)
     shifted.insert(0, types.MessageEntityTextUrl(offset=0, length=1, url=url))
-    res = await client(functions.messages.SendMediaRequest(
-        peer=peer, media=types.InputMediaWebPage(url=url, force_large_media=True), message="\u200b" + text,
-        random_id=random.randrange(-2**63, 2**63), entities=shifted))
+    async def go():
+        return await client(functions.messages.SendMediaRequest(
+            peer=peer, media=types.InputMediaWebPage(url=url, force_large_media=True), message="\u200b" + text,
+            random_id=random.randrange(-2**63, 2**63), entities=shifted))
+    try:
+        res = await go()
+    except Exception as e:
+        if "WEBPAGE_NOT_FOUND" not in str(e):
+            raise
+        await prewarm(url)  # Telegram видит ссылку впервые: просим его загрузить страницу и повторяем
+        res = await go()
     for u in getattr(res, "updates", []) or []:
         if isinstance(u, (types.UpdateNewMessage, types.UpdateNewChannelMessage)):
             return u.message.id

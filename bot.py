@@ -769,14 +769,14 @@ async def _publish(bot: Bot, ch, it: dict) -> tuple[list[int], str]:
             t1 = time.monotonic()
             if get_btns(it):
                 try:  # кнопки-ссылки может добавить только бот; ему нужно право «Редактирование сообщений»
-                    for attempt in range(3):
+                    for attempt in range(5):
                         try:
                             await bot.edit_message_reply_markup(chat_id=ch, message_id=ids[-1], reply_markup=markup(it))
                             break
                         except TelegramBadRequest as e:
-                            if attempt == 2 or "not found" not in str(e).lower():
+                            if attempt == 4 or "not found" not in str(e).lower():
                                 raise
-                            await asyncio.sleep(0.4)  # бот ещё не «увидел» сообщение аккаунта
+                            await asyncio.sleep(0.15)  # бот ещё не «увидел» сообщение аккаунта
                     logging.warning("TIMING item=%s send=%.2fs buttons=%.2fs", it["id"], t1 - t0, time.monotonic() - t1)
                 except Exception as e:
                     await notify(bot, f"⚠️ Пост вышел, но кнопку добавить не удалось: {html.escape(str(e))}\n"
@@ -894,6 +894,16 @@ async def finish_final(it: dict, st: dict | None) -> None:
     if track:
         await userbot.revoke(track)  # уникальные ссылки закрываем: у админа лимит активных приглашений (общие не трогаем)
         await db.upd_item(it["id"], track_done=True)
+
+
+async def keepalive(bot: Bot) -> None:
+    """Держит соединение бота с Telegram тёплым, чтобы правка кнопки не тратила время на новое подключение."""
+    while True:
+        try:
+            await bot.get_me()
+        except Exception:
+            pass
+        await asyncio.sleep(8)
 
 
 async def snap_worker(bot: Bot) -> None:
@@ -1497,6 +1507,7 @@ async def main() -> None:
             await replan(s["id"])
     asyncio.create_task(worker(bot))
     asyncio.create_task(snap_worker(bot))
+    asyncio.create_task(keepalive(bot))
     await bot.delete_webhook(drop_pending_updates=False)
     await dp.start_polling(bot)
 
