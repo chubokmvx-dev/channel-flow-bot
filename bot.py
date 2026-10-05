@@ -272,6 +272,34 @@ async def send_item(bot: Bot, chat, it: dict) -> list[int]:
     return [first.message_id, second.message_id]
 
 
+_DUR = re.compile(r"(\d+(?:[.,]\d+)?)\s*([а-яa-z]*)")
+_UNIT = (("д", 86400), ("d", 86400), ("ч", 3600), ("h", 3600), ("с", 1), ("s", 1), ("м", 60), ("m", 60))
+
+
+def parse_duration(text: str) -> int | None:
+    """«15» (минут), «15м», «1ч 30м», «2 часа», «1д», «90 сек» → секунды. None, если не понял."""
+    t = text.lower().strip()
+    found = _DUR.findall(t)
+    if not found or _DUR.sub("", t).strip(" ,+и"):
+        return None
+    total = 0.0
+    for num, unit in found:
+        mult = 60 if not unit else next((m for u, m in _UNIT if unit.startswith(u)), None)
+        if mult is None:
+            return None
+        total += float(num.replace(",", ".")) * mult
+    return int(round(total)) if total >= 1 else None
+
+
+def fmt_duration(sec: int) -> str:
+    parts = []
+    for name, n in (("д", 86400), ("ч", 3600), ("мин", 60), ("с", 1)):
+        if sec >= n:
+            parts.append(f"{sec // n} {name}")
+            sec %= n
+    return " ".join(parts) or "0 с"
+
+
 def parse_when(text: str) -> datetime | None:
     t = text.strip()
     n = now()
@@ -983,6 +1011,18 @@ async def on_message(m: Message, bot: Bot):
         await apply_time(bot, cur[1], when, fresh=True)
         return
 
+    if cur and cur[0] == "ttl":
+        sec = parse_duration(m.text or "")
+        if not sec:
+            await tmp(bot, "Не понял время. Примеры: 15 (минуты), 45м, 2ч, 1ч 30м, 1д.")
+            return
+        it = await db.get_item(cur[1])
+        await db.upd_item(cur[1], custom_ttl=sec)
+        if it and it["status"] == "sent":
+            await db.upd_item(cur[1], delete_at=it["sent_at"] + timedelta(seconds=sec))
+        await after_item_change(bot, cur[1], fresh=True)
+        return
+
     if cur and cur[0] == "btn":
         t = (m.text or "").strip()
         if t.lower() in ("убрать", "-", "удалить"):
@@ -1298,7 +1338,7 @@ async def on_cb(c: CallbackQuery, bot: Bot):
         return
 
     # дальше действия над конкретным элементом
-    if action in ("md", "tx", "bt", "tm", "pv", "rp", "rm", "up", "dn", "in", "dl", "tt", "mx"):
+    if action in ("md", "tx", "bt", "tm", "pv", "rp", "rm", "up", "dn", "in", "dl", "tt", "mx", "tc"):
         iid = int(parts[0])
         it = await db.get_item(iid)
         if not it:
@@ -1331,9 +1371,16 @@ async def on_cb(c: CallbackQuery, bot: Bot):
             await clear_tmp(bot)
             def tb(n, v):
                 return Btn(text=n, callback_data=f"tt:{iid}:{v}")
-            grid = [[tb("Авто (по правилам набора)", "a")], [tb("2 мин", "120"), tb("10 мин", "600"), tb("1 час", "3600")],
-                    [tb("24 часа", "86400"), tb("Не удалять", "0")], [Btn(text="Отмена", callback_data="cancel")]]
+            grid = [[tb("Авто (по правилам набора)", "a")],
+                    [tb("2 мин", "120"), tb("5 мин", "300"), tb("10 мин", "600"), tb("30 мин", "1800")],
+                    [tb("1 час", "3600"), tb("3 часа", "10800"), tb("24 часа", "86400")],
+                    [Btn(text="✍️ Своё время", callback_data=f"tc:{iid}"), tb("Не удалять", "0")],
+                    [Btn(text="Отмена", callback_data="cancel")]]
             await tmp(bot, "Через сколько после публикации удалить это из канала?", Kb(inline_keyboard=grid))
+        elif action == "tc":
+            await clear_tmp(bot)
+            mode = ("ttl", iid)
+            await tmp(bot, "Впиши, через сколько удалить после публикации. Примеры: 15 (это минуты), 45м, 2ч, 1ч 30м, 1д, 90с.", cancel_kb)
         elif action == "tt":
             v = parts[1]
             await db.upd_item(iid, custom_ttl=None if v == "a" else int(v))
