@@ -117,7 +117,12 @@ async def _send_framed(peer, text: str, ents, url: str) -> int:
     except Exception as e:
         if "WEBPAGE_NOT_FOUND" not in str(e):
             raise
-        await prewarm(url)  # Telegram видит ссылку впервые: просим его загрузить страницу и повторяем
+        # прямую ссылку на картинку Telegram не принял: пробуем страницу с og:image
+        page = re.sub(r"/m/([\w]+)\.jpg$", r"/p/\1", url)
+        if page == url:
+            raise
+        url = page
+        shifted[0] = types.MessageEntityTextUrl(offset=0, length=1, url=url)
         res = await go()
     for u in getattr(res, "updates", []) or []:
         if isinstance(u, (types.UpdateNewMessage, types.UpdateNewChannelMessage)):

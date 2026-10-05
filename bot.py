@@ -156,7 +156,7 @@ def extract(m: Message) -> dict | None:
             "media_msg": m.message_id if media_type else None,
             # ID сообщений в личке у бота и у пользователя разные, поэтому для userbot ищем по времени отправки
             "text_ts": int(m.date.timestamp()) if (m.text or m.caption) else None,
-            "media_ts": int(m.date.timestamp()) if media_type else None}
+            "media_ts": int(m.date.timestamp()) if media_type else None, "media_url": None}
     raw = m.text if m.text is not None else m.caption
     if raw is not None:  # сохраняем сам текст и его entities (в т.ч. премиум-эмодзи): публикация не зависит от исходного сообщения
         ents = m.entities if m.text is not None else m.caption_entities
@@ -1069,8 +1069,8 @@ async def on_message(m: Message, bot: Bot):
         if data is None:
             await tmp(bot, "Этот тип сообщения не поддерживается. Отправь текст, фото, видео, гиф или файл.")
             return
-        await host_photo(bot, data)
         if cur[0] == "media":
+            await host_photo(bot, data)  # карточка только когда фото докрепляют к готовому тексту
             if not data["media_type"]:
                 await tmp(bot, "Нужно фото, видео, гиф или файл.")
                 return
@@ -1106,7 +1106,6 @@ async def on_message(m: Message, bot: Bot):
         if data is None:
             await tmp(bot, "Этот тип сообщения не поддерживается. Отправь текст, фото, видео, гиф или файл.")
             return
-        await host_photo(bot, data)
         global fwd
         fwd = data
         await clear_tmp(bot)
@@ -1122,7 +1121,6 @@ async def on_message(m: Message, bot: Bot):
         s = await db.get_set(view[1])
         data = extract(m)
         if s and data:
-            await host_photo(bot, data)
             await clear_tmp(bot)
             await add_to_draft(bot, s, data)
             await render(bot, fresh=True)   # панель всегда под последним сообщением
@@ -1483,12 +1481,21 @@ async def start_web() -> None:
             raise web.HTTPNotFound()
         return web.Response(body=f[0], content_type=f[1], headers={"Cache-Control": "public, max-age=86400"})
 
+    async def page(request):
+        t = request.match_info["token"]
+        base = public_base()
+        html_ = (f'<!doctype html><html><head><meta charset="utf-8"><meta property="og:image" content="{base}/m/{t}.jpg">'
+                 f'<meta name="twitter:card" content="summary_large_image"><meta name="twitter:image" content="{base}/m/{t}.jpg">'
+                 f'</head><body><img src="{base}/m/{t}.jpg"></body></html>')
+        return web.Response(text=html_, content_type="text/html")
+
     app = web.Application()
     async def root(request):
         return web.Response(text="ok")
 
     app.router.add_get("/", root)
     app.router.add_get("/m/{token}.jpg", media)
+    app.router.add_get("/p/{token}", page)
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", "8080"))).start()
