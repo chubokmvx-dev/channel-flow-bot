@@ -513,7 +513,7 @@ async def v_item(iid: int):
     if it["status"] == "pending":
         rows.append([Btn(text="✏️ Текст", callback_data=f"tx:{iid}"), Btn(text="📎 Медиа", callback_data=f"md:{iid}"),
                      Btn(text="🔗 Кнопки", callback_data=f"bt:{iid}"), Btn(text="🗑 Таймер", callback_data=f"tm:{iid}")])
-        if s["kind"] == "mutual":
+        if s["kind"] == "mutual" or (s["kind"] == "night" and s["p2_at"]):
             rows.append([Btn(text="⬆️", callback_data=f"up:{iid}"), Btn(text="⬇️", callback_data=f"dn:{iid}"),
                          Btn(text="➕ Вставить", callback_data=f"im:{iid}")])
         rows.append([Btn(text="🔁 Заменить", callback_data=f"rp:{iid}"), Btn(text="❌ Убрать", callback_data=f"rm:{iid}")])
@@ -637,6 +637,45 @@ async def apply_plan(plan: dict, items: list[dict]) -> None:
             await db.upd_item(it["id"], delete_at=delete_at)
 
 
+async def night_fix(s: dict, items: list[dict]) -> None:
+    """Запущенная ночь: после вставки, удаления или перестановки заново расставляем время ещё не вышедших сообщений."""
+    p2_at, end_at = s["p2_at"], s["end_at"]
+    if not (p2_at and end_at):
+        return
+    g = timedelta(seconds=await gap())
+    n = now()
+    items = sorted(items, key=lambda i: i["pos"])
+    r1 = [i for i in items if i["role"] == "reminder" and i.get("part", 1) == 1]
+    r2 = [i for i in items if i["role"] == "reminder" and i.get("part") == 2]
+    anchor = p2_at - timedelta(hours=3)  # номинал: 21:00, 22:00, 23:00
+    # 1) часть 1
+    sent1 = [i["sent_at"] for i in items if i["status"] in ("sent", "deleted") and i.get("part", 1) == 1 and i["sent_at"]]
+    earliest = planner.ceil_min(max([n + timedelta(seconds=30)] + [t + g for t in sent1]))
+    pend1 = [(k, i) for k, i in enumerate(r1) if i["status"] == "pending"]
+    nominal = {i["id"]: anchor + timedelta(hours=k) for k, i in pend1}
+    if pend1:
+        if all(nominal[i["id"]] >= earliest for _, i in pend1):
+            times = nominal
+        else:
+            if p2_at - earliest < g * len(pend1):
+                times = None
+            else:
+                step = (p2_at - earliest) / len(pend1)
+                times = {i["id"]: planner.round_min(earliest + step * j) for j, (_, i) in enumerate(pend1)}
+        if times:
+            for i in sorted((i for _, i in pend1), key=lambda x: times[x["id"]]):
+                await db.upd_item(i["id"], send_at=times[i["id"]])
+    # 2) пост 2 и часть 2
+    for i in items:
+        if i["status"] != "pending":
+            continue
+        if i["role"] == "post" and i.get("part") == 2:
+            await db.upd_item(i["id"], send_at=p2_at)
+    for k, i in enumerate(r2):
+        if i["status"] == "pending":
+            await db.upd_item(i["id"], send_at=p2_at + timedelta(hours=2 + 2 * k))
+
+
 async def replan(sid: int, delay: int = 0) -> None:
     s = await db.get_set(sid)
     if not s or s["status"] != "scheduled" or s["paused"]:
@@ -645,6 +684,11 @@ async def replan(sid: int, delay: int = 0) -> None:
     if s["kind"] == "mutual":
         plan = planner.plan_mutual(items, s["start_at"] or now(), await gap(), now() + timedelta(seconds=delay))
     elif s["kind"] == "night":
+        if not any(i["status"] in ("sent", "deleted") for i in items):
+            await launch(None, sid)  # ничего не вышло: пересчитываем всю ночь
+            return
+        await night_fix(s, items)
+        items = [i for i in await db.items_of(sid) if i["status"] != "failed"]
         send = {i["id"]: (i["sent_at"] if i["status"] in ("sent", "deleted") else i["send_at"]) for i in items
                 if i["send_at"] or i["sent_at"]}
         plan = planner.night_deletes(items, send, s["p2_at"], s["end_at"])
@@ -1010,6 +1054,15 @@ async def add_to_draft(bot: Bot, s: dict, data: dict, after_id: int | None = Non
     if not ok:
         await tmp(bot, "⚠️ " + msg)
         return
+    if s["kind"] == "night" and s["status"] != "draft" and after_id and role == "reminder":
+        anc = next((i for i in items if i["id"] == after_id), None)
+        part = (anc.get("part") or 1) if anc else part
+        if sum(1 for i in items if i["role"] == "reminder" and i.get("part", 1) == part) >= 3:
+            await tmp(bot, "⚠️ В каждой части ночи максимум 3 напоминания.")
+            return
+    if s["kind"] == "night" and s["status"] != "draft" and role == "post" and s["p2_at"] and s["p2_at"] <= now():
+        await tmp(bot, "⚠️ Пост 2 выходит в 00:00, это время уже прошло.")
+        return
     status = "draft" if s["status"] == "draft" else "pending"
     iid = await db.add_item(s["id"], role, part, data, status, after_id)
     if s["status"] == "draft":
@@ -1364,8 +1417,12 @@ async def on_cb(c: CallbackQuery, bot: Bot):
         return
     if action == "im":
         await clear_tmp(bot)
+        anchor = await db.get_item(int(parts[0]))
+        sd = await db.get_set(anchor["set_id"]) if anchor else None
+        roles = ["reminder", "post"] if sd and sd["kind"] == "night" else ROLES
         await tmp(bot, "Какое сообщение вставить сразу после этого?", Kb(inline_keyboard=[
-            [Btn(text=ROLE[r], callback_data=f"in:{parts[0]}:{r}") for r in ROLES], [Btn(text="Отмена", callback_data="cancel")]]))
+            [Btn(text=("📢 Пост 2" if sd and sd["kind"] == "night" and r == "post" else ROLE[r]), callback_data=f"in:{parts[0]}:{r}") for r in roles],
+            [Btn(text="Отмена", callback_data="cancel")]]))
         await c.answer()
         return
     if action == "sx":
@@ -1456,6 +1513,14 @@ async def on_cb(c: CallbackQuery, bot: Bot):
             await replan(it["set_id"])
             await open_view(bot, ("set", it["set_id"]))
         elif action in ("up", "dn"):
+            sd = await db.get_set(it["set_id"])
+            if sd["kind"] == "night":  # в ночи меняются местами только однотипные сообщения одной части
+                pend = [i for i in await db.items_of(it["set_id"]) if i["status"] == "pending"]
+                ids = [i["id"] for i in pend]
+                j = ids.index(iid) + (-1 if action == "up" else 1)
+                if not (0 <= j < len(pend)) or (pend[j]["role"], pend[j].get("part")) != (it["role"], it.get("part")):
+                    await c.answer("В ночи местами меняются только напоминания одной части", show_alert=True)
+                    return
             await db.move(iid, -1 if action == "up" else 1)
             await replan(it["set_id"])
             await render(bot)
