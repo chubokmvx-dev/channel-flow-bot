@@ -817,12 +817,14 @@ async def tick(bot: Bot) -> None:
                         except Exception as e:
                             logging.warning("delete failed: %s", e)
         finally:
+            logging.warning("DELETED item=%s set=%s role=%s ids=%s", it["id"], it["set_id"], it["role"], it["ch_msg_ids"])
             await db.upd_item(it["id"], status="deleted", delete_at=None)
     if ch:
         for it in await db.due_sends():
             try:
                 ids, via = await publish(bot, ch, it)
                 await db.mark_sent(it["id"], ids, via)
+                logging.warning("PUBLISHED item=%s set=%s role=%s ids=%s via=%s", it["id"], it["set_id"], it["role"], ids, via)
                 s_ = await db.get_set(it["set_id"])
                 if s_ and s_["kind"] == "mutual":
                     await replan(it["set_id"])
@@ -1437,6 +1439,7 @@ async def start_web() -> None:
 async def main() -> None:
     await db.init(config.DATABASE_URL)
     await start_web()
+    await db.acquire_leader()  # ждём, пока завершится предыдущий экземпляр (при деплое), чтобы не было двойных публикаций
     bot = Bot(config.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
     dp.include_router(router)

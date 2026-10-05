@@ -1,6 +1,20 @@
+import asyncio
+
 import asyncpg
 
 pool: asyncpg.Pool | None = None
+
+
+_lock_conn = None
+
+
+async def acquire_leader(lock_id: int = 7471) -> None:
+    """Только один экземпляр бота работает одновременно. При деплое новый ждёт, пока старый завершится:
+    иначе оба публикуют и удаляют одно и то же, а часть сообщений остаётся в канале без записи о них."""
+    global _lock_conn
+    _lock_conn = await pool.acquire()
+    while not await _lock_conn.fetchval("SELECT pg_try_advisory_lock($1)", lock_id):
+        await asyncio.sleep(1)
 
 
 async def init(dsn: str) -> None:
