@@ -1501,6 +1501,26 @@ async def start_web() -> None:
     await web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", "8080"))).start()
 
 
+async def repair_item(bot: Bot) -> None:
+    """Разовая правка поста 137: бот записал чужой id сообщения (баг рамки); находим настоящий пост и крепим кнопку."""
+    try:
+        it = await db.get_item(137)
+        ch = await channel()
+        if not (it and ch and userbot.enabled() and it["ch_msg_ids"] == "59889" and it["status"] == "sent"):
+            return
+        head = (it.get("plain") or plain(it["text_html"])).strip()[:30]
+        async for m in userbot.client.iter_messages(await userbot._chan(ch), limit=15):
+            if m.out and head and head in (m.message or ""):
+                await db.upd_item(137, ch_msg_ids=str(m.id))
+                logging.warning("REPAIRED item=137 ids=%s", m.id)
+                if get_btns(it):
+                    await bot.edit_message_reply_markup(chat_id=ch, message_id=m.id, reply_markup=markup(it))
+                return
+        logging.warning("REPAIR item=137: пост не найден")
+    except Exception:
+        logging.exception("repair_item failed")
+
+
 async def main() -> None:
     await db.init(config.DATABASE_URL)
     await start_web()
@@ -1512,6 +1532,7 @@ async def main() -> None:
     for s in await db.active_sets():  # пересчитываем расписание уже запущенных наборов по актуальным правилам
         if s["status"] == "scheduled":
             await replan(s["id"])
+    await repair_item(bot)
     asyncio.create_task(worker(bot))
     asyncio.create_task(snap_worker(bot))
     asyncio.create_task(keepalive(bot))

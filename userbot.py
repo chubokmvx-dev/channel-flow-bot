@@ -124,9 +124,20 @@ async def _send_framed(peer, text: str, ents, url: str) -> int:
         url = page
         shifted[0] = types.MessageEntityTextUrl(offset=0, length=1, url=url)
         res = await go()
+    want = utils.get_peer_id(peer)
     for u in getattr(res, "updates", []) or []:
         if isinstance(u, (types.UpdateNewMessage, types.UpdateNewChannelMessage)):
-            return u.message.id
+            try:
+                same = utils.get_peer_id(u.message.peer_id) == want
+            except Exception:
+                same = False
+            if same:
+                return u.message.id
+            logging.warning("framed: пропускаю обновление чужого чата id=%s", getattr(u.message, "id", None))
+    # id не нашёлся в ответе: берём своё последнее сообщение в канале с таким текстом
+    async for m in client.iter_messages(peer, limit=5):
+        if m.out and (m.message or "").strip()[:40] == text.strip()[:40]:
+            return m.id
     raise RuntimeError("не удалось получить id опубликованного сообщения")
 
 
