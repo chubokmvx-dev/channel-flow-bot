@@ -160,6 +160,11 @@ async def items_of(set_id: int) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+async def unsent_items() -> list[dict]:
+    """Посты, которые ещё не вышли в канал (черновики и запланированные)."""
+    return [dict(r) for r in await pool.fetch("SELECT * FROM items WHERE status IN ('draft','pending')")]
+
+
 async def get_item(item_id: int) -> dict | None:
     r = await pool.fetchrow("SELECT * FROM items WHERE id=$1", item_id)
     return dict(r) if r else None
