@@ -49,7 +49,7 @@ BTN_RE = re.compile(r"^(.+?)\s*(?:\s[-–—]\s|\|)\s*((?:https?|tg)://\S+)$", r
 MAIN_KB = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="Создать пост"), KeyboardButton(text="Контент-план"), KeyboardButton(text="Изменить пост")],
-        [KeyboardButton(text="Статистика"), KeyboardButton(text="Настройки"), KeyboardButton(text="Ссылка ВП")],
+        [KeyboardButton(text="Статистика"), KeyboardButton(text="Настройки")],
     ],
     resize_keyboard=True,
     is_persistent=True,
@@ -57,7 +57,6 @@ MAIN_KB = ReplyKeyboardMarkup(
 
 # ---------- состояние интерфейса (бот для одного человека) ----------
 mode: tuple | None = None          # ожидаемый ввод: ("repl"|"media"|"btn", item_id) | ("ins", item_id, role) | ("time", set_id) | ("channel",)
-VP: dict = {"new": None, "old": []}   # ссылка ВП: текущая и все прежние (их везде заменяем на текущую)
 fwd: dict | None = None             # пересланный пост, из которого создаём набор
 view: tuple | None = None          # что показано на «экране»: ("menu",) ("draft", sid) ("list",) ("set", sid) ("item", iid) ("plan",) ("settings",)
 scr_id: int | None = None          # id сообщения-экрана
@@ -167,7 +166,6 @@ def extract(m: Message) -> dict | None:
                                  "language": e.language, "custom_emoji_id": e.custom_emoji_id} for e in (ents or [])])
     if btns:  # кнопки есть только у пересланных постов; у обычных сообщений не затираем уже заданные
         d["btns"] = json.dumps(btns, ensure_ascii=False)
-    d.update(relink.relink_fields(d, VP["old"], VP["new"]) if VP["new"] else {})
     return d
 
 
@@ -706,6 +704,7 @@ async def replan(sid: int, delay: int = 0) -> None:
 async def launch(bot: Bot, sid: int) -> str | None:
     """Возвращает текст ошибки или None, если запущено."""
     s = await db.get_set(sid)
+    await sync_set_link(sid)
     items = await db.items_of(sid)
     if not await channel():
         return "Сначала выбери канал: Настройки → Выбрать канал."
@@ -988,7 +987,7 @@ async def worker(bot: Bot) -> None:
 # ---------- команды и кнопки нижней клавиатуры ----------
 
 HELP = (
-    "Привет! Нижние кнопки: «Создать пост», «Контент-план», «Изменить пост», «Настройки», «Ссылка ВП».\n\n"
+    "Привет! Нижние кнопки: «Создать пост», «Контент-план», «Изменить пост», «Настройки».\n\n"
     "Сначала зайди в «Настройки» и выбери канал (бот должен быть админом канала с правом публиковать и удалять сообщения)."
 )
 
@@ -1017,60 +1016,6 @@ async def btn_edit(m: Message, bot: Bot):
 @router.message(F.text == "Статистика")
 async def btn_stats(m: Message, bot: Bot):
     await open_view(bot, ("stats",), fresh=True)
-
-
-async def load_vp() -> None:
-    VP["new"] = await db.get_setting("vp_link")
-    try:
-        VP["old"] = json.loads(await db.get_setting("vp_old", "[]") or "[]")
-    except ValueError:
-        VP["old"] = []
-
-
-async def set_vp(m: Message, bot: Bot, url: str) -> None:
-    """Новая ссылка ВП: во всех ещё не вышедших постах меняем прежние ссылки на неё, а дальше меняем и в новых."""
-    global mode
-    if not re.match(r"^(?:https?://)?(?:t\.me|telegram\.me)/\S+$", url) and not re.match(r"^https?://\S+$", url):
-        await tmp(bot, "Не похоже на ссылку. Пришли её целиком, например https://t.me/+AbCd…",
-                  Kb(inline_keyboard=[[Btn(text="Отмена", callback_data="cancel")]]))
-        return
-    new = relink.full(url)
-    olds = [o for o in VP["old"] + ([VP["new"]] if VP["new"] else []) if relink.core(o) != relink.core(new)]
-    items = await db.unsent_items()
-    if not olds:  # первый раз: если во всех ещё не вышедших постах одна и та же ссылка-приглашение, это и есть старая
-        found = set()
-        for it in items:
-            found |= relink.find_links(it)
-        found = {f for f in found if relink.core(f) != relink.core(new)}
-        if len(found) == 1:
-            olds = ["https://" + found.pop()]
-    olds = list(dict.fromkeys(olds))
-    n = 0
-    for it in items:
-        upd = relink.relink_fields(it, olds, new)
-        if upd:
-            await db.upd_item(it["id"], **upd)
-            n += 1
-    VP["new"], VP["old"] = new, olds[-30:]
-    await db.set_setting("vp_link", new)
-    await db.set_setting("vp_old", json.dumps(VP["old"]))
-    mode = None
-    await clear_tmp(bot)
-    txt = f"✅ Ссылка ВП: {new}\nИзменено постов: {n}. Во всех новых постах старые ссылки тоже заменятся сами (текст ссылки, скрытая ссылка под словом, кнопки)."
-    if not olds:
-        txt += "\n\nСтарую ссылку я пока не знаю: в следующий раз она запомнится и заменится."
-    await tmp(bot, txt)
-    await render(bot)
-
-
-@router.message(F.text == "Ссылка ВП")
-async def btn_vp(m: Message, bot: Bot):
-    global mode
-    mode = ("vplink",)
-    await clear_tmp(bot)
-    cur = VP["new"] or "не задана"
-    await tmp(bot, f"Текущая ссылка ВП: {cur}\n\nПришли новую ссылку. Я заменю старую на неё везде: в тексте, в скрытых ссылках под словами и в кнопках, формат поста сохраню.",
-              Kb(inline_keyboard=[[Btn(text="Отмена", callback_data="cancel")]]))
 
 
 @router.message(F.text == "Настройки")
@@ -1103,6 +1048,11 @@ async def set_channel(m: Message, bot: Bot, value) -> None:
 # ---------- ввод пользователя ----------
 
 async def add_to_draft(bot: Bot, s: dict, data: dict, after_id: int | None = None, role: str | None = None) -> None:
+    await _add_to_draft(bot, s, data, after_id, role)
+    await sync_set_link(s["id"])
+
+
+async def _add_to_draft(bot: Bot, s: dict, data: dict, after_id: int | None = None, role: str | None = None) -> None:
     items = await db.items_of(s["id"])
     if s["kind"] == "single":
         if items:
@@ -1146,10 +1096,6 @@ async def on_message(m: Message, bot: Bot):
             await set_channel(m, bot, int(t) if t.lstrip("-").isdigit() else t)
         return
 
-    if cur and cur[0] == "vplink":
-        await set_vp(m, bot, (m.text or "").strip())
-        return
-
     if cur and cur[0] == "time":
         when = parse_when(m.text or "")
         if not when:
@@ -1175,8 +1121,6 @@ async def on_message(m: Message, bot: Bot):
         if t.lower() in ("убрать", "-", "удалить"):
             await db.upd_item(cur[1], btn_text=None, btn_url=None, btns=None)
         elif (bl := parse_btns(t)):
-            if VP["new"]:
-                bl = relink.replace_btns(bl, VP["old"], VP["new"])[0]
             await db.upd_item(cur[1], btn_text=None, btn_url=None, btns=json.dumps(bl, ensure_ascii=False))
         else:
             await tmp(bot, f"Не понял. Каждая кнопка с новой строки, до {MAX_BTNS} штук:\nТекст - https://ссылка\nЦвет можно задать значком в начале строки: 🔴 красная, 🔵 синяя, 🟢 зелёная.")
@@ -1250,12 +1194,38 @@ async def on_message(m: Message, bot: Bot):
     await tmp(bot, "Нажми «Создать пост» внизу, чтобы начать.")
 
 
+async def sync_set_link(sid: int) -> int:
+    """Ссылка набора = первая ссылка-приглашение из его первого сообщения, где она есть.
+    Во всех остальных ещё не вышедших сообщениях набора любые другие ссылки-приглашения заменяются на неё:
+    в тексте, в скрытых ссылках под словом и в кнопках (текст и адрес), форматирование сохраняется."""
+    items = await db.items_of(sid)
+    main = None
+    for it in items:
+        links = relink.find_links(it)
+        if links:
+            main = relink.first_link(it)
+            break
+    if not main:
+        return 0
+    n = 0
+    for it in items:
+        if it["status"] not in ("draft", "pending"):
+            continue
+        olds = [("https://" + l) for l in relink.find_links(it) if relink.core(l) != relink.core(main)]
+        upd = relink.relink_fields(it, olds, main) if olds else {}
+        if upd:
+            await db.upd_item(it["id"], **upd)
+            n += 1
+    return n
+
+
 async def after_item_change(bot: Bot, item_id: int, fresh: bool = False) -> None:
     global mode
     mode = None
     await clear_tmp(bot)
     it = await db.get_item(item_id)
     if it:
+        await sync_set_link(it["set_id"])
         s = await db.get_set(it["set_id"])
         if s and s["status"] == "scheduled":
             await replan(s["id"])
@@ -1655,7 +1625,6 @@ async def repair_item(bot: Bot) -> None:
 
 async def main() -> None:
     await db.init(config.DATABASE_URL)
-    await load_vp()
     await start_web()
     await db.acquire_leader()  # ждём, пока завершится предыдущий экземпляр (при деплое), чтобы не было двойных публикаций
     bot = Bot(config.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))

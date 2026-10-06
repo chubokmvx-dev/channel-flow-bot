@@ -145,3 +145,34 @@ def find_links(d: dict) -> set[str]:
     blob = " ".join(filter(None, [d.get("plain"), d.get("text_html"), d.get("btns"), d.get("btn_url"), d.get("ents")]))
     found.update(inv.findall(blob.replace("\\/", "/")))
     return found
+
+
+def first_link(d: dict) -> str | None:
+    """Первая ссылка-приглашение поста в порядке появления: скрытая/видимая в тексте, затем кнопки."""
+    inv = re.compile(r"(?:https?://)?t\.me/(?:\+|joinchat/)[\w\-]+")
+    cands = []
+    try:
+        for e in json.loads(d["ents"]) if d.get("ents") else []:
+            if e.get("url"):
+                cands.append((e["offset"], e["url"]))
+    except ValueError:
+        pass
+    plain = d.get("plain") or ""
+    for mt in inv.finditer(plain):
+        cands.append((len(plain[:mt.start()].encode("utf-16-le")) // 2, mt.group(0)))
+    cands.sort()
+    for _, u in cands:
+        if inv.fullmatch(u.strip()) or inv.match(u.strip()):
+            return full(inv.match(u.strip()).group(0))
+    try:
+        for b in json.loads(d["btns"]) if d.get("btns") else []:
+            m = inv.match((b.get("url") or "").strip())
+            if m:
+                return full(m.group(0))
+    except ValueError:
+        pass
+    if d.get("btn_url") and inv.match(d["btn_url"]):
+        return full(inv.match(d["btn_url"]).group(0))
+    # ссылка есть только в сыром html (старые записи)
+    m = inv.search((d.get("text_html") or "").replace("&amp;", "&"))
+    return full(m.group(0)) if m else None
