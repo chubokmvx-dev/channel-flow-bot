@@ -531,6 +531,8 @@ async def v_item(iid: int):
     else:
         if it["ch_msg_ids"]:
             rows.append([Btn(text="✏️ Текст в канале", callback_data=f"tx:{iid}"), Btn(text="🔗 Кнопки в канале", callback_data=f"bt:{iid}")])
+            if it["media_type"] == "photo":
+                rows.append([Btn(text="🖼 Заменить фото в канале", callback_data=f"md:{iid}")])
         rows.append([Btn(text="🗑 Таймер", callback_data=f"tm:{iid}"), Btn(text="🗑 Удалить из канала сейчас", callback_data=f"dl:{iid}")])
     back = f"set:{it['set_id']}" if s["status"] == "scheduled" else "hist"
     rows.append([Btn(text="👁 Показать", callback_data=f"pv:{iid}"), Btn(text="◀️ Назад", callback_data=back)])
@@ -870,13 +872,28 @@ async def put_reactions(bot: Bot, ch, it: dict, msg_id: int) -> None:
         logging.exception("reactions")
 
 
-async def live_edit(bot: Bot, it: dict, text: bool = False, btns: bool = False) -> str | None:
+async def live_edit(bot: Bot, it: dict, text: bool = False, btns: bool = False, media: bool = False) -> str | None:
     """Применяет правку к сообщению, которое уже стоит в канале. Возвращает текст ошибки или None."""
     ch = await channel()
     if not (ch and it.get("ch_msg_ids")):
         return "сообщение в канале не найдено"
     ids = [int(x) for x in it["ch_msg_ids"].split(",")]
     try:
+        if media and it["media_url"]:
+            text = True          # карточка: картинка задаётся скрытой ссылкой в тексте, правим сообщение целиком
+        elif media:
+            target = ids[-1]     # вложенное фото: у длинного поста фото отдельным сообщением без подписи
+            single = len(ids) == 1
+            if it.get("via") == "user" and userbot.enabled():
+                buf = io.BytesIO()
+                await bot.download(it["file_id"], destination=buf)
+                body = (it.get("plain") if it.get("plain") is not None else plain(it["text_html"])) if single else None
+                await userbot.edit_photo(ch, target, buf.getvalue(), body, it.get("ents"))
+            else:
+                from aiogram.types import InputMediaPhoto
+                await bot.edit_message_media(chat_id=ch, message_id=target, reply_markup=markup(it),
+                                             media=InputMediaPhoto(media=it["file_id"], caption=(it["text_html"] or None) if single else None,
+                                                                   show_caption_above_media=True))
         if text:
             body = it.get("plain") if it.get("plain") is not None else plain(it["text_html"])
             photo_card = it["media_url"] if it["media_type"] == "photo" else None
@@ -891,7 +908,7 @@ async def live_edit(bot: Bot, it: dict, text: bool = False, btns: bool = False) 
             else:
                 opts = LinkPreviewOptions(is_disabled=False, prefer_large_media=True) if hidden_preview(it) else LinkPreviewOptions(is_disabled=True)
                 await bot.edit_message_text(it["text_html"], chat_id=ch, message_id=ids[0], link_preview_options=opts, reply_markup=markup(it))
-        if (text or btns) and (it.get("via") == "user" or btns):
+        if (text or btns or media) and (it.get("via") == "user" or btns):
             # правка от аккаунта снимает кнопки бота: возвращаем актуальные (или убираем, если их больше нет)
             for attempt in range(4):
                 try:
@@ -911,7 +928,7 @@ async def live_edit(bot: Bot, it: dict, text: bool = False, btns: bool = False) 
     except Exception as e:
         logging.exception("live_edit")
         return str(e)
-    logging.warning("EDITED item=%s text=%s btns=%s", it["id"], text, btns)
+    logging.warning("EDITED item=%s text=%s btns=%s media=%s", it["id"], text, btns, media)
     return None
 
 
@@ -1215,7 +1232,18 @@ async def on_message(m: Message, bot: Bot):
             await tmp(bot, "Этот тип сообщения не поддерживается. Отправь текст, фото, видео, гиф или файл.")
             return
         if cur[0] == "media":
+            cur_it = await db.get_item(cur[1])
+            sent = bool(cur_it and cur_it["status"] == "sent")
+            if sent:
+                if data["media_type"] != "photo":
+                    await tmp(bot, "В опубликованном посте можно заменить только фото. Отправь фото.")
+                    return
+                if not (cur_it["media_url"] or cur_it["media_type"] == "photo"):
+                    await tmp(bot, "В этом посте не было фото, добавить его в уже вышедшее сообщение нельзя.")
+                    return
             await host_photo(bot, data)  # карточка только когда фото докрепляют к готовому тексту
+            if sent and not cur_it["media_url"]:
+                data["media_url"] = None   # вложенное фото остаётся вложенным, карточкой не делаем
             if not data["media_type"]:
                 await tmp(bot, "Нужно фото, видео, гиф или файл.")
                 return
@@ -1223,6 +1251,10 @@ async def on_message(m: Message, bot: Bot):
                               media_msg=data["media_msg"], media_ts=data["media_ts"], src_msg=None,
                               media_url=data["media_url"])
             await after_item_change(bot, cur[1], fresh=True)
+            if sent:
+                it2 = await db.get_item(cur[1])
+                err = await live_edit(bot, it2, media=True)
+                await tmp(bot, "✅ Фото заменено в канале." if not err else f"⚠️ В канале не изменилось: {html.escape(err[:200])}")
         elif cur[0] == "repl":
             await db.upd_item(cur[1], **data)
             await after_item_change(bot, cur[1], fresh=True)
@@ -1593,9 +1625,9 @@ async def on_cb(c: CallbackQuery, bot: Bot):
             await clear_tmp(bot)
             mode = ("media", iid)
             rows = [[Btn(text="Отмена", callback_data="cancel")]]
-            if it["media_type"]:
+            if it["media_type"] and it["status"] != "sent":
                 rows.insert(0, [Btn(text="🗑 Убрать медиа", callback_data=f"mx:{iid}")])
-            await tmp(bot, "Отправь фото, видео, гиф или файл.", Kb(inline_keyboard=rows))
+            await tmp(bot, "Отправь новое фото." if it["status"] == "sent" else "Отправь фото, видео, гиф или файл.", Kb(inline_keyboard=rows))
         elif action == "tx":
             await clear_tmp(bot)
             mode = ("txt", iid)

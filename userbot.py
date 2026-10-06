@@ -249,6 +249,16 @@ async def edit(ch, msg_id: int, text: str, stored_ents: str | None, media_url: s
         raise
 
 
+async def edit_photo(ch, msg_id: int, data: bytes, caption: str | None, stored_ents: str | None) -> None:
+    """Заменяет фото в уже опубликованном сообщении; подпись и её форматирование сохраняются."""
+    peer = await _chan(ch)
+    f = await client.upload_file(data, file_name="photo.jpg")
+    ents = entities_from_json(stored_ents) or None
+    await client(functions.messages.EditMessageRequest(
+        peer=peer, id=msg_id, message=caption or "", entities=ents if caption else None,
+        media=types.InputMediaUploadedPhoto(file=f), invert_media=True if caption else None))
+
+
 REACTIONS = ["👍", "❤", "🔥"]
 
 
