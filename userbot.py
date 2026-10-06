@@ -225,6 +225,27 @@ async def send(ch, text_ts: int | None, media_ts: int | None, text_plain: str = 
     return [m.id]
 
 
+REACTIONS = ["👍", "❤", "🔥"]
+
+
+async def react(ch, msg_id: int) -> str | None:
+    """Ставит реакции от аккаунта (у Premium до 3 сразу). Возвращает текст ошибки или None."""
+    peer = await _chan(ch)
+    last = None
+    for attempt in range(3):
+        for emojis in (REACTIONS, REACTIONS[:1]):   # если нельзя три сразу, хотя бы одну
+            try:
+                await client(functions.messages.SendReactionRequest(
+                    peer=peer, msg_id=msg_id, reaction=[types.ReactionEmoji(emoticon=e) for e in emojis]))
+                return None
+            except Exception as e:
+                last = str(e)
+                if "FLOOD" in last.upper() or "NOT_FOUND" in last.upper() or "MESSAGE_ID_INVALID" in last.upper():
+                    break   # сообщение ещё не видно или лимит: ждём и повторяем
+        await asyncio.sleep(1.5 * (attempt + 1))
+    return last
+
+
 async def delete(ch, ids: list[int]) -> None:
     peer = await _chan(ch)
     await client.delete_messages(peer, ids)

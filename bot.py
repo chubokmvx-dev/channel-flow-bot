@@ -561,8 +561,11 @@ async def v_settings():
             f"👤 Публикация от твоего аккаунта (премиум-эмодзи): {'включена' if userbot.enabled() else 'выключена'}")
     lm = (await db.get_setting("link_mode", "shared")) == "unique"
     text += "\n🔗 Ссылки-приглашения в кнопках: " + ("своя для каждого сообщения (точный счёт вступлений)" if lm else "ваша ссылка как есть (вступления считаются приблизительно)")
+    rx = (await db.get_setting("react_warmup", "1")) == "1"
+    text += "\n👍 Реакции на разогревы (👍 ❤ 🔥): " + ("ставятся сами" if rx else "выключены")
     kb = Kb(inline_keyboard=[
         [Btn(text="📣 Выбрать канал", callback_data="cfg:channel")],
+        [Btn(text="👍 Реакции: " + ("→ выключить" if rx else "→ включить"), callback_data="cfg:react")],
         [Btn(text="🔗 Ссылки: " + ("→ как есть" if lm else "→ уникальные"), callback_data="cfg:links")],
         [Btn(text=("✓ " if g == v else "") + f"{v // 60} мин", callback_data=f"cfg:gap:{v}") for v in (60, 120, 180, 300)],
         [Btn(text=("✓ " if (lo, hi) == (a, b) else "") + f"{a // 60}–{b // 60} мин", callback_data=f"cfg:start:{a}:{b}")
@@ -831,11 +834,27 @@ async def _publish(bot: Bot, ch, it: dict) -> tuple[list[int], str]:
                 except Exception as e:
                     await notify(bot, f"⚠️ Пост вышел, но кнопку добавить не удалось: {html.escape(str(e))}\n"
                                       "Включи боту в канале право «Редактирование сообщений».")
+            if it.get("role") == "warmup" and (await db.get_setting("react_warmup", "1")) == "1":
+                spawn(put_reactions(bot, ch, it, ids[0]))
             return ids, "user"
         except Exception as e:
             logging.warning("userbot send failed, fallback to bot: %s", e)
             await notify(bot, f"⚠️ Не вышло опубликовать от твоего аккаунта ({html.escape(str(e))}). Публикую через бота, премиум-эмодзи могут не сохраниться.")
     return await send_item(bot, ch, it), "bot"
+
+
+async def put_reactions(bot: Bot, ch, it: dict, msg_id: int) -> None:
+    """Реакции 👍 ❤ 🔥 на разогрев от вашего аккаунта; в фоне, публикацию не задерживают."""
+    try:
+        err = await userbot.react(ch, msg_id)
+        if err:
+            logging.warning("reactions failed item=%s: %s", it["id"], err)
+            await notify(bot, f"⚠️ Реакции на разогрев #{it['id']} не поставились ({html.escape(err[:120])}). "
+                              "Проверьте, что в канале разрешены реакции 👍 ❤ 🔥.")
+        else:
+            logging.warning("REACTED item=%s msg=%s", it["id"], msg_id)
+    except Exception as e:
+        logging.exception("reactions")
 
 
 _snap_fail: dict[tuple, int] = {}
@@ -1312,6 +1331,10 @@ async def on_cb(c: CallbackQuery, bot: Bot):
         elif parts[0] == "links":
             cur = await db.get_setting("link_mode", "shared")
             await db.set_setting("link_mode", "shared" if cur == "unique" else "unique")
+            await render(bot)
+        elif parts[0] == "react":
+            cur = await db.get_setting("react_warmup", "1")
+            await db.set_setting("react_warmup", "0" if cur == "1" else "1")
             await render(bot)
         elif parts[0] == "gap":
             await db.set_setting("gap", parts[1])
