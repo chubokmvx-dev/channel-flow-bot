@@ -225,6 +225,30 @@ async def send(ch, text_ts: int | None, media_ts: int | None, text_plain: str = 
     return [m.id]
 
 
+async def edit(ch, msg_id: int, text: str, stored_ents: str | None, media_url: str | None = None, keep_preview: bool = False) -> None:
+    """Правит текст уже опубликованного сообщения (с форматированием, премиум-эмодзи, скрытыми ссылками)."""
+    peer = await _chan(ch)
+    ents = entities_from_json(stored_ents) or None
+    try:
+        if media_url and text.strip():   # карточка: скрытая ссылка на картинку в начале поста
+            url = await ensure_preview(media_url) or media_url
+            shifted = []
+            for e in ents or []:
+                e2 = copy.copy(e)
+                e2.offset += 1
+                shifted.append(e2)
+            shifted.insert(0, types.MessageEntityTextUrl(offset=0, length=1, url=url))
+            await client(functions.messages.EditMessageRequest(
+                peer=peer, id=msg_id, message="\u200b" + text, entities=shifted,
+                media=types.InputMediaWebPage(url=url, force_large_media=True)))
+        else:
+            await client.edit_message(peer, msg_id, text, formatting_entities=ents, link_preview=keep_preview)
+    except Exception as e:
+        if "MESSAGE_NOT_MODIFIED" in str(e).upper() or "not modified" in str(e).lower():
+            return
+        raise
+
+
 REACTIONS = ["👍", "❤", "🔥"]
 
 

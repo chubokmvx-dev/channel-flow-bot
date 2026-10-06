@@ -165,6 +165,14 @@ async def unsent_items() -> list[dict]:
     return [dict(r) for r in await pool.fetch("SELECT * FROM items WHERE status IN ('draft','pending')")]
 
 
+async def recent_sent(days: int = 14, limit: int = 20) -> list[dict]:
+    """Уже опубликованные и ещё стоящие в канале сообщения (для правки)."""
+    rows = await pool.fetch(
+        "SELECT i.*, s.kind FROM items i JOIN sets s ON s.id=i.set_id WHERE i.status='sent' AND i.ch_msg_ids IS NOT NULL "
+        "AND i.sent_at > now() - make_interval(days => $1) ORDER BY i.sent_at DESC LIMIT $2", days, limit)
+    return [dict(r) for r in rows]
+
+
 async def get_item(item_id: int) -> dict | None:
     r = await pool.fetchrow("SELECT * FROM items WHERE id=$1", item_id)
     return dict(r) if r else None

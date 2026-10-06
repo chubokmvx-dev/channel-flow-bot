@@ -448,10 +448,18 @@ async def v_list():
         when = "черновик" if s["status"] == "draft" else f"дальше {fmt(s['next_at'])}" if s["next_at"] else "идёт удаление"
         rep = " 🔁" if s["repeat"] else ""
         kb.append([Btn(text=f"{KIND[s['kind']]}{rep} · {s['n']} шт. · {when}", callback_data=f"set:{s['id']}")])
-    if not kb:
-        return "Пока нет постов для изменения. Нажми «Создать пост».", Kb(inline_keyboard=[[Btn(text="✖️ Закрыть", callback_data="close")]])
+    kb.append([Btn(text="📚 Уже в канале (править текст и кнопки)", callback_data="hist")])
     kb.append([Btn(text="✖️ Закрыть", callback_data="close")])
-    return "Что изменить?", Kb(inline_keyboard=kb)
+    return ("Что изменить?" if len(kb) > 2 else "Запланированных наборов нет. Опубликованные посты можно править здесь:"), Kb(inline_keyboard=kb)
+
+
+async def v_hist():
+    rows = await db.recent_sent()
+    if not rows:
+        return "Опубликованных постов за последние 2 недели нет.", Kb(inline_keyboard=[[Btn(text="◀️ Назад", callback_data="list")]])
+    kb = [[Btn(text=f"{fmt(r['sent_at'])} · {label(r, r['kind'])}: {html.unescape(snip(r, 24))}", callback_data=f"it:{r['id']}")] for r in rows]
+    kb.append([Btn(text="◀️ Назад", callback_data="list")])
+    return "Опубликованные сообщения (последние 2 недели). Выбери, какое поправить:", Kb(inline_keyboard=kb)
 
 
 async def v_set(sid: int):
@@ -521,8 +529,11 @@ async def v_item(iid: int):
                          Btn(text="➕ Вставить", callback_data=f"im:{iid}")])
         rows.append([Btn(text="🔁 Заменить", callback_data=f"rp:{iid}"), Btn(text="❌ Убрать", callback_data=f"rm:{iid}")])
     else:
+        if it["ch_msg_ids"]:
+            rows.append([Btn(text="✏️ Текст в канале", callback_data=f"tx:{iid}"), Btn(text="🔗 Кнопки в канале", callback_data=f"bt:{iid}")])
         rows.append([Btn(text="🗑 Таймер", callback_data=f"tm:{iid}"), Btn(text="🗑 Удалить из канала сейчас", callback_data=f"dl:{iid}")])
-    rows.append([Btn(text="👁 Показать", callback_data=f"pv:{iid}"), Btn(text="◀️ Назад", callback_data=f"set:{it['set_id']}")])
+    back = f"set:{it['set_id']}" if s["status"] == "scheduled" else "hist"
+    rows.append([Btn(text="👁 Показать", callback_data=f"pv:{iid}"), Btn(text="◀️ Назад", callback_data=back)])
     return "\n".join(lines), Kb(inline_keyboard=rows)
 
 
@@ -583,6 +594,8 @@ async def build_view():
         return await v_draft(v[1])
     if v[0] == "list":
         return await v_list()
+    if v[0] == "hist":
+        return await v_hist()
     if v[0] == "set":
         return await v_set(v[1])
     if v[0] == "item":
@@ -855,6 +868,51 @@ async def put_reactions(bot: Bot, ch, it: dict, msg_id: int) -> None:
             logging.warning("REACTED item=%s msg=%s", it["id"], msg_id)
     except Exception as e:
         logging.exception("reactions")
+
+
+async def live_edit(bot: Bot, it: dict, text: bool = False, btns: bool = False) -> str | None:
+    """Применяет правку к сообщению, которое уже стоит в канале. Возвращает текст ошибки или None."""
+    ch = await channel()
+    if not (ch and it.get("ch_msg_ids")):
+        return "сообщение в канале не найдено"
+    ids = [int(x) for x in it["ch_msg_ids"].split(",")]
+    try:
+        if text:
+            body = it.get("plain") if it.get("plain") is not None else plain(it["text_html"])
+            photo_card = it["media_url"] if it["media_type"] == "photo" else None
+            if it.get("via") == "user" and userbot.enabled():
+                await userbot.edit(ch, ids[0], body, it.get("ents"), photo_card, hidden_preview(it))
+            elif it["media_type"] and not photo_card:
+                await bot.edit_message_caption(chat_id=ch, message_id=ids[0], caption=it["text_html"] or None, reply_markup=markup(it))
+            elif photo_card:
+                opts = LinkPreviewOptions(url=photo_card, prefer_large_media=True, show_above_text=False)
+                await bot.edit_message_text(f'<a href="{photo_card}">\u200b</a>' + it["text_html"], chat_id=ch, message_id=ids[0],
+                                            link_preview_options=opts, reply_markup=markup(it))
+            else:
+                opts = LinkPreviewOptions(is_disabled=False, prefer_large_media=True) if hidden_preview(it) else LinkPreviewOptions(is_disabled=True)
+                await bot.edit_message_text(it["text_html"], chat_id=ch, message_id=ids[0], link_preview_options=opts, reply_markup=markup(it))
+        if (text or btns) and (it.get("via") == "user" or btns):
+            # правка от аккаунта снимает кнопки бота: возвращаем актуальные (или убираем, если их больше нет)
+            for attempt in range(4):
+                try:
+                    await bot.edit_message_reply_markup(chat_id=ch, message_id=ids[-1], reply_markup=markup(it))
+                    break
+                except TelegramBadRequest as e:
+                    low = str(e).lower()
+                    if "not modified" in low:
+                        break
+                    if attempt == 3 or "not found" not in low:
+                        raise
+                    await asyncio.sleep(0.3)
+    except TelegramBadRequest as e:
+        if "not modified" in str(e).lower():
+            return None
+        return str(e)
+    except Exception as e:
+        logging.exception("live_edit")
+        return str(e)
+    logging.warning("EDITED item=%s text=%s btns=%s", it["id"], text, btns)
+    return None
 
 
 _snap_fail: dict[tuple, int] = {}
@@ -1145,6 +1203,10 @@ async def on_message(m: Message, bot: Bot):
             await tmp(bot, f"Не понял. Каждая кнопка с новой строки, до {MAX_BTNS} штук:\nТекст - https://ссылка\nЦвет можно задать значком в начале строки: 🔴 красная, 🔵 синяя, 🟢 зелёная.")
             return
         await after_item_change(bot, cur[1], fresh=True)
+        it2 = await db.get_item(cur[1])
+        if it2 and it2["status"] == "sent":
+            err = await live_edit(bot, it2, btns=True)
+            await tmp(bot, "✅ Кнопки изменены в канале." if not err else f"⚠️ В канале не изменилось: {html.escape(err[:200])}")
         return
 
     if cur and cur[0] in ("media", "repl", "ins", "txt"):
@@ -1166,6 +1228,9 @@ async def on_message(m: Message, bot: Bot):
             await after_item_change(bot, cur[1], fresh=True)
         elif cur[0] == "txt":
             it = await db.get_item(cur[1])
+            if it and it["status"] == "sent" and data["media_type"]:
+                await tmp(bot, "У опубликованного поста можно менять только текст. Отправь текстовое сообщение.")
+                return
             if data["media_type"] or not (it and it["media_type"]):
                 # прислали фото с подписью или у поста нет медиа: берём сообщение целиком
                 await db.upd_item(cur[1], **data)
@@ -1174,6 +1239,10 @@ async def on_message(m: Message, bot: Bot):
                 await db.upd_item(cur[1], text_html=data["text_html"], text_msg=data["text_msg"], text_ts=data["text_ts"], src_msg=None,
                                   plain=data.get("plain"), ents=data.get("ents"))
             await after_item_change(bot, cur[1], fresh=True)
+            it2 = await db.get_item(cur[1])
+            if it2 and it2["status"] == "sent":
+                err = await live_edit(bot, it2, text=True)
+                await tmp(bot, "✅ Текст изменён в канале." if not err else f"⚠️ В канале не изменилось: {html.escape(err[:200])}")
         else:
             it = await db.get_item(cur[1])
             s = await db.get_set(it["set_id"])
@@ -1301,7 +1370,7 @@ async def on_cb(c: CallbackQuery, bot: Bot):
         await render(bot)
         await c.answer("Обновлено")
         return
-    if action in ("plan", "list"):
+    if action in ("plan", "list", "hist"):
         await open_view(bot, (action,))
         await c.answer()
         return
