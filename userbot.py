@@ -94,11 +94,40 @@ def entities_from_json(raw: str | None) -> list:
     return out
 
 
-async def prewarm(url: str) -> None:
+WARNINGS: list[str] = []   # что пошло не по плану при публикации: бот прочитает и напишет владельцу
+
+
+async def _preview_ready(url: str) -> bool:
+    """Есть ли у Telegram уже готовый предпросмотр этой ссылки."""
     try:
-        await client(functions.messages.GetWebPageRequest(url=url, hash=0))
+        r = await client(functions.messages.GetWebPageRequest(url=url, hash=0))
     except Exception as e:
         logging.info("prewarm failed: %s", e)
+        return False
+    w = getattr(r, "webpage", r)
+    return isinstance(w, types.WebPage)
+
+
+async def prewarm(url: str) -> bool:
+    return await _preview_ready(url)
+
+
+async def ensure_preview(url: str, wait: float = 6.0) -> str | None:
+    """Ждёт, пока Telegram скачает и разберёт ссылку; пробует саму картинку, затем страницу с og:image.
+    Возвращает ссылку, у которой предпросмотр готов (или None, если не дождались)."""
+    page = re.sub(r"/m/([\w]+)\.jpg$", r"/p/\1", url)
+    cands = [url] + ([page] if page != url else [])
+    loop = asyncio.get_event_loop()
+    end = loop.time() + wait
+    delay = 0.4
+    while True:
+        for u in cands:
+            if await _preview_ready(u):
+                return u
+        if loop.time() >= end:
+            return None
+        await asyncio.sleep(delay)
+        delay = min(delay * 1.6, 2.0)
 
 
 async def _send_framed(peer, text: str, ents, url: str) -> int:
@@ -164,9 +193,13 @@ async def send(ch, text_ts: int | None, media_ts: int | None, text_plain: str = 
         ents = (tm.entities if tm else None) or None
     if media_url and text.strip():
         try:
-            return [await _send_framed(peer, text, ents, media_url)]
+            ready = await ensure_preview(media_url)
+            if not ready:
+                logging.warning("preview not ready in time for %s, trying anyway", media_url)
+            return [await _send_framed(peer, text, ents, ready or media_url)]
         except Exception as e:
             logging.warning("framed send failed, fallback to attached media: %s", e)
+            WARNINGS.append(f"карточка с фото не вышла ({str(e)[:120]}), фото ушло вложением")
     if media_ts:
         mm = tm if (tm is not None and media_ts == text_ts and tm.media) else await _find(media_ts, None, True)  # у stored_text медиа ищем по своему времени
         if not mm:

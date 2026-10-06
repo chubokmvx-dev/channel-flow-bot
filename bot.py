@@ -240,6 +240,8 @@ async def host_photo(bot: Bot, data: dict) -> None:
         token = secrets.token_urlsafe(9).replace("-", "a").replace("_", "b")
         await db.put_file(token, buf.getvalue(), "image/jpeg")
         data["media_url"] = f"{base}/m/{token}.jpg"
+        if userbot.enabled():
+            spawn(userbot.ensure_preview(data["media_url"], wait=20))  # заранее просим Telegram скачать картинку: к публикации превью уже готово
     except Exception:
         logging.exception("host_photo failed")
 
@@ -811,6 +813,8 @@ async def _publish(bot: Bot, ch, it: dict) -> tuple[list[int], str]:
                                      it["media_url"] if it["media_type"] == "photo" else None, hidden_preview(it),
                                      it.get("plain"), it.get("ents"))
             t1 = time.monotonic()
+            while userbot.WARNINGS:
+                await notify(bot, f"⚠️ Пост #{it['id']}: {html.escape(userbot.WARNINGS.pop(0))}. Можно переопубликовать.")
             if get_btns(it):
                 try:  # кнопки-ссылки может добавить только бот; ему нужно право «Редактирование сообщений»
                     for attempt in range(5):
