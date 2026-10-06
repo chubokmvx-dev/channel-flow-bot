@@ -1,5 +1,6 @@
 """Публикация и удаление в канале от имени аккаунта владельца (чтобы работали премиум-эмодзи).
 Содержимое берём из его же сообщений в чате с ботом: так сохраняются все entities, включая custom emoji."""
+import asyncio
 import copy
 import json
 import logging
@@ -112,18 +113,25 @@ async def _send_framed(peer, text: str, ents, url: str) -> int:
         return await client(functions.messages.SendMediaRequest(
             peer=peer, media=types.InputMediaWebPage(url=url, force_large_media=True), message="\u200b" + text,
             random_id=random.randrange(-2**63, 2**63), entities=shifted))
-    try:
-        res = await go()
-    except Exception as e:
-        if "WEBPAGE_NOT_FOUND" not in str(e):
-            raise
-        # прямую ссылку на картинку Telegram не принял: пробуем страницу с og:image
-        page = re.sub(r"/m/([\w]+)\.jpg$", r"/p/\1", url)
-        if page == url:
-            raise
-        url = page
-        shifted[0] = types.MessageEntityTextUrl(offset=0, length=1, url=url)
-        res = await go()
+    page = re.sub(r"/m/([\w]+)\.jpg$", r"/p/\1", url)
+    tries = [url, url, page, page, url] if page != url else [url, url, url]
+    res, err = None, None
+    for i, u in enumerate(tries):
+        if u != url:
+            url = u
+            shifted[0] = types.MessageEntityTextUrl(offset=0, length=1, url=url)
+        try:
+            res = await go()
+            break
+        except Exception as e:
+            if "WEBPAGE_NOT_FOUND" not in str(e):
+                raise
+            err = e
+            # Telegram качает страницу асинхронно: просим загрузить предпросмотр и ждём, пока он появится
+            await prewarm(url)
+            await asyncio.sleep(1.5 + i * 0.5)
+    if res is None:
+        raise err
     want = utils.get_peer_id(peer)
     for u in getattr(res, "updates", []) or []:
         if isinstance(u, (types.UpdateNewMessage, types.UpdateNewChannelMessage)):
