@@ -117,6 +117,7 @@ async def ensure_preview(url: str, wait: float = 6.0) -> str | None:
     Возвращает ссылку, у которой предпросмотр готов (или None, если не дождались)."""
     page = re.sub(r"/m/([\w]+)\.jpg$", r"/p/\1", url)
     cands = [url] + ([page] if page != url else [])
+    cands += [c + "?v=2" for c in cands]   # свежий адрес: Telegram мог закешировать неудачу по старому
     loop = asyncio.get_event_loop()
     end = loop.time() + wait
     delay = 0.4
@@ -143,7 +144,9 @@ async def _send_framed(peer, text: str, ents, url: str) -> int:
             peer=peer, media=types.InputMediaWebPage(url=url, force_large_media=True), message="\u200b" + text,
             random_id=random.randrange(-2**63, 2**63), entities=shifted))
     page = re.sub(r"/m/([\w]+)\.jpg$", r"/p/\1", url)
-    tries = [url, url, page, page, url] if page != url else [url, url, url]
+    base = url.split("?")[0]
+    page = re.sub(r"/m/([\w]+)\.jpg$", r"/p/\1", base)
+    tries = [url, url, page, base + "?v=2", page + "?v=2"] if page != base else [url, url, base + "?v=2"]
     res, err = None, None
     for i, u in enumerate(tries):
         if u != url:
