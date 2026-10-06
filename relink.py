@@ -97,7 +97,7 @@ def replace_btns(btns: list[dict], olds: list[str], new: str):
             changed = True
         t, _, ch = replace_text(b.get("text", ""), [], olds, new)
         if ch:
-            b["text"] = t[:60]
+            b["text"] = t
             changed = True
         out.append(b)
     return out, changed

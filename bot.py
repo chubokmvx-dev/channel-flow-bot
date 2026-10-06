@@ -196,7 +196,7 @@ def parse_btns(text: str) -> list[dict] | None:
         mt = BTN_RE.match(line)
         if not mt:
             return None
-        out.append({"text": mt.group(1).strip()[:60], "url": mt.group(2), "style": style})
+        out.append({"text": mt.group(1).strip()[:128], "url": mt.group(2), "style": style})
     return out if 0 < len(out) <= MAX_BTNS else None
 
 
@@ -205,7 +205,7 @@ def buttons_from_markup(rm) -> list[dict]:
     for row in getattr(rm, "inline_keyboard", None) or []:
         for b in row:
             if getattr(b, "url", None):
-                out.append({"text": b.text[:60], "url": b.url, "style": getattr(b, "style", None)})
+                out.append({"text": b.text[:128], "url": b.url, "style": getattr(b, "style", None)})
     return out[:MAX_BTNS]
 
 
@@ -836,19 +836,14 @@ async def _publish(bot: Bot, ch, it: dict) -> tuple[list[int], str]:
             while userbot.WARNINGS:
                 await notify(bot, f"⚠️ Пост #{it['id']}: {html.escape(userbot.WARNINGS.pop(0))}. Можно переопубликовать.")
             if get_btns(it):
-                try:  # кнопки-ссылки может добавить только бот; ему нужно право «Редактирование сообщений»
-                    for attempt in range(5):
-                        try:
-                            await bot.edit_message_reply_markup(chat_id=ch, message_id=ids[-1], reply_markup=markup(it))
-                            break
-                        except TelegramBadRequest as e:
-                            if attempt == 4 or "not found" not in str(e).lower():
-                                raise
-                            await asyncio.sleep(0.15)  # бот ещё не «увидел» сообщение аккаунта
+                err = await attach_buttons(bot, ch, ids[-1], it, quick=True)
+                if err == "retry":      # бот ещё не «увидел» сообщение аккаунта: дожимаем в фоне, публикацию не задерживаем
+                    spawn(attach_buttons_later(bot, ch, ids[-1], it))
+                elif err:
+                    await notify(bot, f"⚠️ Пост #{it['id']} вышел, но кнопку добавить не удалось: {html.escape(err[:300])}\n"
+                                      "Если это про права, включи боту в канале «Редактирование сообщений». Кнопки можно добавить вручную: «Изменить пост» → «📚 Уже в канале».")
+                else:
                     logging.warning("TIMING item=%s send=%.2fs buttons=%.2fs", it["id"], t1 - t0, time.monotonic() - t1)
-                except Exception as e:
-                    await notify(bot, f"⚠️ Пост вышел, но кнопку добавить не удалось: {html.escape(str(e))}\n"
-                                      "Включи боту в канале право «Редактирование сообщений».")
             if it.get("role") == "warmup" and (await db.get_setting("react_warmup", "1")) == "1":
                 spawn(put_reactions(bot, ch, it, ids[0]))
             return ids, "user"
@@ -856,6 +851,62 @@ async def _publish(bot: Bot, ch, it: dict) -> tuple[list[int], str]:
             logging.warning("userbot send failed, fallback to bot: %s", e)
             await notify(bot, f"⚠️ Не вышло опубликовать от твоего аккаунта ({html.escape(str(e))}). Публикую через бота, премиум-эмодзи могут не сохраниться.")
     return await send_item(bot, ch, it), "bot"
+
+
+def clean_btns(it: dict) -> Kb | None:
+    """Запасной вариант разметки: текст без управляющих символов, до 64 знаков, адрес с https."""
+    out = []
+    for b in get_btns(it):
+        t = re.sub(r"[\u0000-\u001f\u200b-\u200f\u2028-\u202f]", "", b.get("text") or "").strip()[:64] or "Открыть"
+        u = (b.get("url") or "").strip()
+        if not re.match(r"^(?:https?|tg)://", u):
+            u = "https://" + u
+        out.append([Btn(text=t, url=u)])
+    return Kb(inline_keyboard=out) if out else None
+
+
+async def attach_buttons(bot: Bot, ch, mid: int, it: dict, quick: bool = False) -> str | None:
+    """Крепит кнопки-ссылки к сообщению в канале. None = готово, "retry" = сообщение ещё не видно боту, иначе текст ошибки."""
+    tries = 5 if quick else 1
+    for attempt in range(tries):
+        try:
+            await bot.edit_message_reply_markup(chat_id=ch, message_id=mid, reply_markup=markup(it))
+            return None
+        except TelegramBadRequest as e:
+            low = str(e).lower()
+            if "not modified" in low:
+                return None
+            if "not found" in low:
+                if attempt == tries - 1:
+                    return "retry"
+                await asyncio.sleep(0.15)
+                continue
+            logging.warning("BUTTON FAIL item=%s err=%s btns=%s", it.get("id"), e, it.get("btns") or it.get("btn_url"))
+            try:   # похоже на неподходящий текст или адрес кнопки: пробуем очищенный вариант
+                await bot.edit_message_reply_markup(chat_id=ch, message_id=mid, reply_markup=clean_btns(it))
+                logging.warning("BUTTON OK after cleanup item=%s", it.get("id"))
+                return None
+            except Exception as e2:
+                logging.warning("BUTTON FAIL2 item=%s err=%s", it.get("id"), e2)
+                return f"{e} / после очистки: {e2}"
+        except Exception as e:
+            logging.warning("BUTTON FAIL item=%s err=%s", it.get("id"), e)
+            return str(e)
+    return "retry"
+
+
+async def attach_buttons_later(bot: Bot, ch, mid: int, it: dict) -> None:
+    for delay in (1, 2, 3, 5, 8, 13, 20, 30):
+        await asyncio.sleep(delay)
+        err = await attach_buttons(bot, ch, mid, it)
+        if err is None:
+            logging.warning("BUTTON late OK item=%s after +%ss", it.get("id"), delay)
+            return
+        if err != "retry":
+            await notify(bot, f"⚠️ Пост #{it['id']}: кнопку добавить не удалось: {html.escape(err[:300])}")
+            return
+    await notify(bot, f"⚠️ Пост #{it['id']} вышел без кнопки: Telegram так и не показал боту сообщение. "
+                      "Добавьте кнопку вручную: «Изменить пост» → «📚 Уже в канале».")
 
 
 async def put_reactions(bot: Bot, ch, it: dict, msg_id: int) -> None:
