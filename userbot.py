@@ -2,6 +2,7 @@
 Содержимое берём из его же сообщений в чате с ботом: так сохраняются все entities, включая custom emoji."""
 import asyncio
 import copy
+import io
 import json
 import logging
 import random
@@ -181,9 +182,35 @@ async def _send_framed(peer, text: str, ents, url: str) -> int:
     raise RuntimeError("не удалось получить id опубликованного сообщения")
 
 
+async def _send_bytes(peer, kind: str | None, data: bytes, name: str, text: str, ents) -> list[int]:
+    """Публикация медиа из скачанного файла (запасной путь, когда исходное сообщение в чате с ботом не найдено)."""
+    def fresh():
+        f = io.BytesIO(data)
+        f.name = name
+        return f
+    kw = {}
+    if kind == "voice":
+        kw["voice_note"] = True
+    if kind == "document":
+        kw["force_document"] = True
+    if len(text) > 1024:
+        first = await client.send_message(peer, text, formatting_entities=ents, link_preview=False)
+        second = await client.send_file(peer, fresh(), **kw)
+        return [first.id, second.id]
+    if kind in ("photo", "video", "animation") and text:
+        try:
+            m = await client.send_file(peer, fresh(), caption=text, formatting_entities=ents, invert_media=True, **kw)
+            return [m.id]
+        except TypeError:
+            pass
+    m = await client.send_file(peer, fresh(), caption=text or None, formatting_entities=ents, **kw)
+    return [m.id]
+
+
 async def send(ch, text_ts: int | None, media_ts: int | None, text_plain: str = "",
                media_url: str | None = None, keep_preview: bool = False,
-               stored_text: str | None = None, stored_ents: str | None = None) -> list[int]:
+               stored_text: str | None = None, stored_ents: str | None = None,
+               media_type: str | None = None, media_fallback=None) -> list[int]:
     peer = await _chan(ch)
     if stored_text is not None:
         tm = None
@@ -203,9 +230,15 @@ async def send(ch, text_ts: int | None, media_ts: int | None, text_plain: str = 
         except Exception as e:
             logging.warning("framed send failed, fallback to attached media: %s", e)
             WARNINGS.append(f"карточка с фото не вышла ({str(e)[:120]}), фото ушло вложением")
-    if media_ts:
-        mm = tm if (tm is not None and media_ts == text_ts and tm.media) else await _find(media_ts, None, True)  # у stored_text медиа ищем по своему времени
+    if media_ts or (media_type and media_fallback):
+        mm = None
+        if media_ts:
+            mm = tm if (tm is not None and media_ts == text_ts and tm.media) else await _find(media_ts, None, True)  # у stored_text медиа ищем по своему времени
         if not mm:
+            if media_fallback:   # исходное сообщение в чате с ботом не нашли: берём файл у бота по file_id и загружаем сами
+                logging.warning("SEND via downloaded media: type=%s media_ts=%s", media_type, media_ts)
+                data, name = await media_fallback()
+                return await _send_bytes(peer, media_type, data, name, text, ents)
             raise RuntimeError("исходное сообщение в чате с ботом не найдено (удалено или слишком старое?)")
         if len(text) <= 1024:
             if mm.voice or mm.audio:  # голосовые и аудио: подпись обычная, без «над медиа»

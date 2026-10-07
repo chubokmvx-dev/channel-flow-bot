@@ -829,9 +829,20 @@ async def _publish(bot: Bot, ch, it: dict) -> tuple[list[int], str]:
     if userbot.enabled() and (it["text_ts"] or it["media_ts"] or it.get("plain") is not None):
         try:
             t0 = time.monotonic()
+
+            async def media_fallback():
+                buf = io.BytesIO()
+                await bot.download(it["file_id"], destination=buf)
+                names = {"voice": "voice.ogg", "audio": "audio.mp3", "video": "video.mp4", "animation": "animation.mp4", "photo": "photo.jpg"}
+                return buf.getvalue(), names.get(it["media_type"], "file")
+
+            has_media = bool(it["media_type"] and it.get("file_id"))
+            logging.warning("SEND item=%s role=%s media=%s media_ts=%s", it["id"], it["role"], it["media_type"], it["media_ts"])
             ids = await userbot.send(ch, it["text_ts"], it["media_ts"], plain(it["text_html"]),
                                      it["media_url"] if it["media_type"] == "photo" else None, hidden_preview(it),
-                                     it.get("plain"), it.get("ents"))
+                                     it.get("plain"), it.get("ents"),
+                                     media_type=it["media_type"] if has_media else None,
+                                     media_fallback=media_fallback if has_media else None)
             t1 = time.monotonic()
             while userbot.WARNINGS:
                 await notify(bot, f"⚠️ Пост #{it['id']}: {html.escape(userbot.WARNINGS.pop(0))}. Можно переопубликовать.")
