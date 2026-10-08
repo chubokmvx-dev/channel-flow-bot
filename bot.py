@@ -497,6 +497,8 @@ async def v_set(sid: int):
         kb.insert(0, ctl)
     if has_pending and not any(i["status"] in ("sent", "deleted") for i in items):
         kb.insert(1 if ctl else 0, [Btn(text="🕐 Изменить время", callback_data=f"tp:{sid}")])
+    if s["kind"] == "mutual" or (s["kind"] == "night" and s["p2_at"]):
+        kb.append([Btn(text="➕ Добавить сообщение", callback_data=f"ad:{sid}")])  # работает и когда всё запланированное уже вышло
     kb.append([Btn(text="⏹ Остановить…", callback_data=f"sx:{sid}"), Btn(text="◀️ Назад", callback_data="list")])
     return "\n".join(lines[:60]), Kb(inline_keyboard=kb)
 
@@ -1637,6 +1639,25 @@ async def on_cb(c: CallbackQuery, bot: Bot):
             await replan(sid)
             await c.answer("Шаг пропущен")
         await open_view(bot, ("set", sid))
+        return
+    if action == "ad":
+        await clear_tmp(bot)
+        sid = int(parts[0])
+        sd = await db.get_set(sid)
+        its = [i for i in await db.items_of(sid) if i["status"] != "failed"]
+        if not sd or sd["status"] != "scheduled" or not its:
+            await c.answer("Набор уже закрыт", show_alert=True)
+            return
+        anchor = its[-1]["id"]       # вставляем в конец: после последнего сообщения набора
+        if sd["kind"] == "night":
+            posts = sum(1 for i in its if i["role"] == "post")
+            roles = (["post"] if posts < 2 else []) + ["reminder"]
+        else:
+            roles = ROLES
+        await tmp(bot, "Какое сообщение добавить в конец набора?", Kb(inline_keyboard=[
+            [Btn(text=("📢 Пост 2" if sd["kind"] == "night" and r == "post" else ROLE[r]), callback_data=f"in:{anchor}:{r}") for r in roles],
+            [Btn(text="Отмена", callback_data="cancel")]]))
+        await c.answer()
         return
     if action == "im":
         await clear_tmp(bot)
