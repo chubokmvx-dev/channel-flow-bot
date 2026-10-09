@@ -85,7 +85,7 @@ def plain(text_html: str) -> str:
 def snip(it: dict, n: int = 28) -> str:
     t = plain(it["text_html"]).replace("\n", " ").strip()
     if not t:
-        t = {"photo": "фото", "video": "видео", "animation": "гиф", "voice": "голосовое", "audio": "аудио", "document": "файл"}.get(it["media_type"], "…")
+        t = {"photo": "фото", "video": "видео", "animation": "гиф", "voice": "голосовое", "audio": "аудио", "document": "файл", "sticker": "стикер", "dice": "анимация"}.get(it["media_type"], "…")
     return html.escape(t[:n] + ("…" if len(t) > n else ""))
 
 
@@ -146,6 +146,10 @@ def extract(m: Message) -> dict | None:
         media_type, file_id = "voice", m.voice.file_id
     elif m.audio:
         media_type, file_id = "audio", m.audio.file_id
+    elif m.sticker:
+        media_type, file_id = "sticker", m.sticker.file_id
+    elif m.dice:
+        media_type, file_id = "dice", m.dice.emoji
     elif m.document:
         media_type, file_id = "document", m.document.file_id
     elif not m.text:
@@ -264,6 +268,10 @@ async def send_item(bot: Bot, chat, it: dict) -> list[int]:
     if not mt:
         opts = LinkPreviewOptions(is_disabled=False, prefer_large_media=True) if hidden_preview(it) else LinkPreviewOptions(is_disabled=True)
         return [(await bot.send_message(chat, text or "…", reply_markup=kb, link_preview_options=opts)).message_id]
+    if mt == "sticker":
+        return [(await bot.send_sticker(chat, fid, reply_markup=kb)).message_id]
+    if mt == "dice":
+        return [(await bot.send_dice(chat, emoji=fid, reply_markup=kb)).message_id]
     sender = {"photo": bot.send_photo, "video": bot.send_video, "animation": bot.send_animation, "voice": bot.send_voice, "audio": bot.send_audio,
               "document": bot.send_document}[mt]
     if len(text) <= 1024:
@@ -888,7 +896,7 @@ async def _publish(bot: Bot, ch, it: dict) -> tuple[list[int], str]:
             async def media_fallback():
                 buf = io.BytesIO()
                 await bot.download(it["file_id"], destination=buf)
-                names = {"voice": "voice.ogg", "audio": "audio.mp3", "video": "video.mp4", "animation": "animation.mp4", "photo": "photo.jpg"}
+                names = {"voice": "voice.ogg", "audio": "audio.mp3", "video": "video.mp4", "animation": "animation.mp4", "photo": "photo.jpg", "sticker": "sticker.webp"}
                 return buf.getvalue(), names.get(it["media_type"], "file")
 
             has_media = bool(it["media_type"] and it.get("file_id"))
@@ -1375,7 +1383,7 @@ async def on_message(m: Message, bot: Bot):
     if cur and cur[0] in ("media", "repl", "ins", "txt"):
         data = extract(m)
         if data is None:
-            await tmp(bot, "Этот тип сообщения не поддерживается. Отправь текст, фото, видео, гиф или файл.")
+            await tmp(bot, "Этот тип сообщения не поддерживается. Отправь текст, фото, видео, гиф, стикер или файл.")
             return
         if cur[0] == "media":
             cur_it = await db.get_item(cur[1])
@@ -1434,7 +1442,7 @@ async def on_message(m: Message, bot: Bot):
     if m.forward_origin and not (view and view[0] == "draft"):
         data = extract(m)
         if data is None:
-            await tmp(bot, "Этот тип сообщения не поддерживается. Отправь текст, фото, видео, гиф или файл.")
+            await tmp(bot, "Этот тип сообщения не поддерживается. Отправь текст, фото, видео, гиф, стикер или файл.")
             return
         global fwd
         fwd = data
@@ -1455,7 +1463,7 @@ async def on_message(m: Message, bot: Bot):
             await add_to_draft(bot, s, data)
             await render(bot, fresh=True)   # панель всегда под последним сообщением
             return
-        await tmp(bot, "Этот тип сообщения не поддерживается. Отправь текст, фото, видео, гиф или файл.")
+        await tmp(bot, "Этот тип сообщения не поддерживается. Отправь текст, фото, видео, гиф, стикер или файл.")
         return
     await tmp(bot, "Нажми «Создать пост» внизу, чтобы начать.")
 

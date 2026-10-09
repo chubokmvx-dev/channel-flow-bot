@@ -240,6 +240,12 @@ async def send(ch, text_ts: int | None, media_ts: int | None, text_plain: str = 
                 data, name = await media_fallback()
                 return await _send_bytes(peer, media_type, data, name, text, ents)
             raise RuntimeError("исходное сообщение в чате с ботом не найдено (удалено или слишком старое?)")
+        if mm.sticker or isinstance(mm.media, types.MessageMediaDice):   # стикеры и анимированные эмодзи: без подписи
+            if isinstance(mm.media, types.MessageMediaDice):
+                m = await client.send_file(peer, types.InputMediaDice(emoticon=mm.media.emoticon))
+            else:
+                m = await client.send_file(peer, mm.media)
+            return [m.id]
         if len(text) <= 1024:
             if mm.voice or mm.audio:  # голосовые и аудио: подпись обычная, без «над медиа»
                 m = await client.send_file(peer, mm.media, caption=text or None, formatting_entities=ents)
