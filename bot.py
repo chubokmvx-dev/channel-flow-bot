@@ -374,9 +374,45 @@ async def v_menu():
         [Btn(text=KIND["single"], callback_data="new:single")],
         [Btn(text=KIND["mutual"], callback_data="new:mutual")],
         [Btn(text=KIND["night"], callback_data="new:night")],
+        [Btn(text="📋 Из шаблона", callback_data="tpls")],
         [Btn(text="❌ Отмена", callback_data="close")],
     ])
     return "Какой пост создаём?", kb
+
+
+TPL_REMINDER_TTL = 120   # стандарт шаблонов: напоминание удаляется через 2 минуты, если свой таймер не задан
+
+
+def ttl_text(sec) -> str:
+    if sec is None:
+        return "по правилам набора"
+    if sec == 0:
+        return "не удаляется"
+    return f"через {sec // 3600} ч" if sec % 3600 == 0 else (f"через {sec // 60} мин" if sec % 60 == 0 else f"через {sec} с")
+
+
+async def v_tpls():
+    tpls = await db.list_templates()
+    kb = [[Btn(text=f"📋 {t['name']} · {KIND[t['kind']].split(' ', 1)[0]} · {t['n']} шт.", callback_data=f"tl:{t['id']}")] for t in tpls[:30]]
+    kb.append([Btn(text="◀️ Назад", callback_data="menu")])
+    text = ("Шаблоны. Выбери, из какого создать набор:" if tpls else
+            "Шаблонов пока нет. Собери набор как обычно и нажми «💾 Сохранить как шаблон» в черновике.")
+    return text, Kb(inline_keyboard=kb)
+
+
+async def v_tpl(tid: int):
+    t = await db.get_template(tid)
+    if not t:
+        return await v_tpls()
+    its = await db.template_items(tid)
+    lines = [f"<b>📋 {html.escape(t['name'])}</b> · {KIND[t['kind']]}", ""]
+    for n, it in enumerate(its, 1):
+        d = ttl_text(it["custom_ttl"] if it["custom_ttl"] is not None else (TPL_REMINDER_TTL if it["role"] == "reminder" else None))
+        lines.append(f"{n}. {label(it, t['kind'])}: {snip(it)}{flags(it)} · удаление: {d}")
+    lines += ["", "Напоминания без своего таймера удаляются через 2 минуты. Таймеры, которые ты задал, сохранены."]
+    return "\n".join(lines[:60]), Kb(inline_keyboard=[
+        [Btn(text="▶️ Создать набор из шаблона", callback_data=f"tu:{tid}")],
+        [Btn(text="🗑 Удалить шаблон", callback_data=f"td:{tid}"), Btn(text="◀️ Назад", callback_data="tpls")]])
 
 
 async def v_draft(sid: int):
@@ -415,6 +451,12 @@ async def v_draft(sid: int):
         if s["kind"] != "single":
             extra.append(Btn(text="↩️ Убрать последнее", callback_data=f"rl:{sid}"))
         rows.append(extra)
+    if items:
+        rows.insert(0, [Btn(text=f"✏️ {n}", callback_data=f"it:{i['id']}") for n, i in enumerate(items[:8], 1)])   # править любое сообщение
+        tr = [Btn(text="💾 Сохранить как шаблон", callback_data=f"ts:{sid}")]
+        if s.get("tpl_id"):
+            tr.append(Btn(text="♻️ Обновить шаблон", callback_data=f"tr:{sid}"))
+        rows.append(tr)
     go = ("✅ Запланировать" if s["start_at"] else "🚀 Опубликовать") if s["kind"] == "single" else "🚀 Запустить"
     when = fmt(s["start_at"], True) if s["start_at"] else "сразу"
     rows.append([Btn(text=f"🕐 {when}", callback_data=f"tp:{sid}"),
@@ -516,17 +558,24 @@ async def v_item(iid: int):
         lines.append("📎 Есть медиа")
     for b in get_btns(it):
         lines.append(f"🔗 {STYLE_EMOJI.get(b.get('style'), '')}{html.escape(b['text'])} → {html.escape(b['url'])}")
-    if it["status"] == "pending":
+    if it["status"] == "draft":
+        lines.append("Выйдет: после запуска набора")
+    elif it["status"] == "pending":
         lines.append(f"Выйдет: {fmt(it['send_at'], True)}")
     else:
         lines.append(f"Опубликовано: {fmt(it['sent_at'], True)}")
     ttl = it["custom_ttl"]
-    lines.append("Удаление: " + (f"{fmt(it['delete_at'], True)}" + (" (по таймеру)" if ttl else "") if it["delete_at"] else "не удаляется"))
+    if it["status"] == "draft":
+        lines.append("Удаление: " + ttl_text(ttl))
+    else:
+      lines.append("Удаление: " + (f"{fmt(it['delete_at'], True)}" + (" (по таймеру)" if ttl else "") if it["delete_at"] else "не удаляется"))
     rows = []
-    if it["status"] == "pending":
+    if it["status"] in ("draft", "pending"):
         rows.append([Btn(text="✏️ Текст", callback_data=f"tx:{iid}"), Btn(text="📎 Медиа", callback_data=f"md:{iid}"),
                      Btn(text="🔗 Кнопки", callback_data=f"bt:{iid}"), Btn(text="🗑 Таймер", callback_data=f"tm:{iid}")])
-        if s["kind"] == "mutual" or (s["kind"] == "night" and s["p2_at"]):
+        if it["status"] == "draft" and s["kind"] != "single":
+            rows.append([Btn(text="⬆️", callback_data=f"up:{iid}"), Btn(text="⬇️", callback_data=f"dn:{iid}")])
+        elif s["kind"] == "mutual" or (s["kind"] == "night" and s["p2_at"]):
             rows.append([Btn(text="⬆️", callback_data=f"up:{iid}"), Btn(text="⬇️", callback_data=f"dn:{iid}"),
                          Btn(text="➕ Вставить", callback_data=f"im:{iid}")])
         rows.append([Btn(text="🔁 Заменить", callback_data=f"rp:{iid}"), Btn(text="❌ Убрать", callback_data=f"rm:{iid}")])
@@ -536,7 +585,7 @@ async def v_item(iid: int):
             if it["media_type"] == "photo":
                 rows.append([Btn(text="🖼 Заменить фото в канале", callback_data=f"md:{iid}")])
         rows.append([Btn(text="🗑 Таймер", callback_data=f"tm:{iid}"), Btn(text="🗑 Удалить из канала сейчас", callback_data=f"dl:{iid}")])
-    back = f"set:{it['set_id']}" if s["status"] == "scheduled" else "hist"
+    back = f"set:{it['set_id']}" if s["status"] == "scheduled" else f"dv:{it['set_id']}" if s["status"] == "draft" else "hist"
     rows.append([Btn(text="👁 Показать", callback_data=f"pv:{iid}"), Btn(text="◀️ Назад", callback_data=back)])
     return "\n".join(lines), Kb(inline_keyboard=rows)
 
@@ -596,6 +645,10 @@ async def build_view():
         return await v_menu()
     if v[0] == "draft":
         return await v_draft(v[1])
+    if v[0] == "tpls":
+        return await v_tpls()
+    if v[0] == "tpl":
+        return await v_tpl(v[1])
     if v[0] == "list":
         return await v_list()
     if v[0] == "hist":
@@ -1254,6 +1307,35 @@ async def on_message(m: Message, bot: Bot):
             await set_channel(m, bot, int(t) if t.lstrip("-").isdigit() else t)
         return
 
+    if cur and cur[0] == "tname":
+        name = (m.text or "").strip()
+        if not name:
+            await tmp(bot, "Нужно название текстом.")
+            return
+        s = await db.get_set(cur[1])
+        if not s:
+            mode = None
+            return
+        tid = await db.save_template(name, s["kind"], await db.items_of(cur[1]))
+        await db.upd_set(cur[1], tpl_id=tid)
+        mode = None
+        await clear_tmp(bot)
+        await render(bot, fresh=True)
+        await tmp(bot, f"✅ Шаблон «{html.escape(name[:60])}» сохранён. Найдёшь его в «Создать пост → 📋 Из шаблона».")
+        return
+
+    if cur and cur[0] == "tlink":
+        url = re.search(r"(?:https?://)?t\.me/(?:\+|joinchat/)[\w\-]+", (m.text or "").strip())
+        if not url:
+            await tmp(bot, "Не вижу ссылки-приглашения вида https://t.me/+… Отправь её ещё раз или нажми «Пропустить».")
+            return
+        n = await apply_new_link(cur[1], relink.full(url.group(0)))
+        mode = None
+        await clear_tmp(bot)
+        await render(bot, fresh=True)
+        await tmp(bot, f"✅ Ссылка заменена в сообщениях: {n}." if n else "Старых ссылок-приглашений в наборе не нашёл, ничего не менял.")
+        return
+
     if cur and cur[0] == "time":
         when = parse_when(m.text or "")
         if not when:
@@ -1378,6 +1460,42 @@ async def on_message(m: Message, bot: Bot):
     await tmp(bot, "Нажми «Создать пост» внизу, чтобы начать.")
 
 
+async def use_template(tid: int) -> int | None:
+    """Создаёт черновик набора из шаблона. Свои таймеры сохраняются, у напоминаний без таймера — 2 минуты."""
+    t = await db.get_template(tid)
+    tis = await db.template_items(tid)
+    if not t or not tis:
+        return None
+    sid = await db.new_set(t["kind"])
+    await db.upd_set(sid, tpl_id=tid)
+    for ti in tis:
+        fields = {k: ti.get(k) for k in db.TPL_FIELDS}
+        iid = await db.add_item(sid, ti["role"], ti.get("part") or 1, fields, "draft")
+        ttl = ti["custom_ttl"]
+        if ttl is None and ti["role"] == "reminder":
+            ttl = TPL_REMINDER_TTL
+        if ttl is not None:
+            await db.upd_item(iid, custom_ttl=ttl)
+    items = await db.items_of(sid)
+    if t["kind"] != "single" and items:
+        await db.upd_set(sid, next_role=next_role_after(t["kind"], items, items[-1]["role"]))
+    return sid
+
+
+async def apply_new_link(sid: int, new: str) -> int:
+    """Заменяет все ссылки-приглашения во всех ещё не вышедших сообщениях набора на новую."""
+    n = 0
+    for it in await db.items_of(sid):
+        if it["status"] not in ("draft", "pending"):
+            continue
+        olds = [("https://" + l) for l in relink.find_links(it)]
+        upd = relink.relink_fields(it, olds, new) if olds else {}
+        if upd:
+            await db.upd_item(it["id"], **upd)
+            n += 1
+    return n
+
+
 async def sync_set_link(sid: int) -> int:
     """Ссылка набора = первая ссылка-приглашение из его первого сообщения, где она есть.
     Во всех остальных ещё не вышедших сообщениях набора любые другие ссылки-приглашения заменяются на неё:
@@ -1480,6 +1598,67 @@ async def on_cb(c: CallbackQuery, bot: Bot):
         sid = await db.new_set(parts[0])
         await add_to_draft(bot, await db.get_set(sid), data, role="post")
         await open_view(bot, ("draft", sid), fresh=True)
+        await c.answer()
+        return
+    if action in ("tpls", "menu"):
+        await open_view(bot, (action,))
+        await c.answer()
+        return
+    if action == "dv":
+        await open_view(bot, ("draft", int(parts[0])))
+        await c.answer()
+        return
+    if action == "tl":
+        await open_view(bot, ("tpl", int(parts[0])))
+        await c.answer()
+        return
+    if action == "td":
+        tid = int(parts[0])
+        await clear_tmp(bot)
+        await tmp(bot, "Удалить шаблон? Наборы, уже созданные из него, не изменятся.", Kb(inline_keyboard=[[
+            Btn(text="🗑 Да, удалить", callback_data=f"tdy:{tid}"), Btn(text="Отмена", callback_data="cancel")]]))
+        await c.answer()
+        return
+    if action == "tdy":
+        await db.delete_template(int(parts[0]))
+        await open_view(bot, ("tpls",))
+        await c.answer("Шаблон удалён")
+        return
+    if action == "tu":
+        tid = int(parts[0])
+        sid = await use_template(tid)
+        if not sid:
+            await c.answer("Шаблон пуст или удалён", show_alert=True)
+            return
+        await db.drop_empty_drafts(except_id=sid)
+        await open_view(bot, ("draft", sid), fresh=True)
+        mode = ("tlink", sid)
+        await tmp(bot, "🔗 Пришли новую ссылку на канал: заменю её во всех сообщениях набора (в тексте, скрытых ссылках и кнопках), форматирование сохраню.\n"
+                       "Если ссылка менять не нужно, нажми «Пропустить».",
+                  Kb(inline_keyboard=[[Btn(text="Пропустить", callback_data="tk")]]))
+        await c.answer()
+        return
+    if action == "tk":
+        mode = None
+        await clear_tmp(bot)
+        await c.answer()
+        return
+    if action == "ts":
+        sid = int(parts[0])
+        await clear_tmp(bot)
+        mode = ("tname", sid)
+        await tmp(bot, "Как назвать шаблон? Отправь название.", Kb(inline_keyboard=[[Btn(text="Отмена", callback_data="cancel")]]))
+        await c.answer()
+        return
+    if action == "tr":
+        sid = int(parts[0])
+        s = await db.get_set(sid)
+        t = await db.get_template(s["tpl_id"]) if s and s.get("tpl_id") else None
+        if not t:
+            await c.answer("Шаблон не найден, сохрани как новый", show_alert=True)
+            return
+        await db.update_template(t["id"], await db.items_of(sid))
+        await tmp(bot, f"✅ Шаблон «{html.escape(t['name'])}» обновлён.")
         await c.answer()
         return
     if action == "new":
@@ -1755,11 +1934,12 @@ async def on_cb(c: CallbackQuery, bot: Bot):
         elif action == "rm":
             await db.del_item(iid)
             await replan(it["set_id"])
-            await open_view(bot, ("set", it["set_id"]))
+            sd = await db.get_set(it["set_id"])
+            await open_view(bot, ("draft", it["set_id"]) if sd and sd["status"] == "draft" else ("set", it["set_id"]))
         elif action in ("up", "dn"):
             sd = await db.get_set(it["set_id"])
             if sd["kind"] == "night":  # в ночи меняются местами только однотипные сообщения одной части
-                pend = [i for i in await db.items_of(it["set_id"]) if i["status"] == "pending"]
+                pend = [i for i in await db.items_of(it["set_id"]) if i["status"] in ("draft", "pending")]
                 ids = [i["id"] for i in pend]
                 j = ids.index(iid) + (-1 if action == "up" else 1)
                 if not (0 <= j < len(pend)) or (pend[j]["role"], pend[j].get("part")) != (it["role"], it.get("part")):

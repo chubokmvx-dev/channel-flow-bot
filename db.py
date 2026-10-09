@@ -68,6 +68,22 @@ async def init(dsn: str) -> None:
     await pool.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS btns TEXT")
     await pool.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS ents TEXT")
     await pool.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS plain TEXT")
+    await pool.execute(
+        "CREATE TABLE IF NOT EXISTS templates (id SERIAL PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL, "
+        "created_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+    )
+    await pool.execute(
+        """
+        CREATE TABLE IF NOT EXISTS template_items (
+            id SERIAL PRIMARY KEY, template_id INT NOT NULL REFERENCES templates(id) ON DELETE CASCADE,
+            role TEXT NOT NULL, part INT NOT NULL DEFAULT 1, pos DOUBLE PRECISION NOT NULL,
+            text_html TEXT NOT NULL DEFAULT '', media_type TEXT, file_id TEXT, btn_text TEXT, btn_url TEXT,
+            custom_ttl INT, src_chat BIGINT, src_msg BIGINT, text_msg BIGINT, media_msg BIGINT,
+            text_ts BIGINT, media_ts BIGINT, media_url TEXT, btns TEXT, ents TEXT, plain TEXT
+        )
+        """
+    )
+    await pool.execute("ALTER TABLE sets ADD COLUMN IF NOT EXISTS tpl_id INT")
     await pool.execute("ALTER TABLE sets ADD COLUMN IF NOT EXISTS repeat TEXT")
     await pool.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS track TEXT")
     await pool.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS track_done BOOLEAN NOT NULL DEFAULT false")
@@ -306,3 +322,49 @@ async def stale_tracks(days: int = 3, limit: int = 10) -> list[dict]:
         "SELECT * FROM items WHERE track IS NOT NULL AND NOT track_done AND sent_at < now() - make_interval(days => $1::int) LIMIT $2::int",
         days, limit)
     return [dict(r) for r in rows]
+
+
+# ---------- шаблоны ----------
+TPL_FIELDS = ("text_html", "media_type", "file_id", "btn_text", "btn_url", "custom_ttl", "src_chat", "src_msg", "text_msg",
+              "media_msg", "text_ts", "media_ts", "media_url", "btns", "ents", "plain")
+
+
+async def _tpl_fill(tpl_id: int, items: list[dict]) -> None:
+    await pool.execute("DELETE FROM template_items WHERE template_id=$1", tpl_id)
+    for n, it in enumerate(items, 1):
+        cols = ", ".join(TPL_FIELDS)
+        ph = ", ".join(f"${i + 5}" for i in range(len(TPL_FIELDS)))
+        await pool.execute(
+            f"INSERT INTO template_items (template_id, role, part, pos, {cols}) VALUES ($1,$2,$3,$4,{ph})",
+            tpl_id, it["role"], it.get("part") or 1, float(n), *[it.get(f) for f in TPL_FIELDS],
+        )
+
+
+async def save_template(name: str, kind: str, items: list[dict]) -> int:
+    tid = await pool.fetchval("INSERT INTO templates (name, kind) VALUES ($1,$2) RETURNING id", name[:60], kind)
+    await _tpl_fill(tid, items)
+    return tid
+
+
+async def update_template(tpl_id: int, items: list[dict]) -> None:
+    await _tpl_fill(tpl_id, items)
+
+
+async def list_templates() -> list[dict]:
+    rows = await pool.fetch(
+        "SELECT t.*, (SELECT count(*) FROM template_items i WHERE i.template_id=t.id) AS n FROM templates t ORDER BY t.id DESC"
+    )
+    return [dict(r) for r in rows]
+
+
+async def get_template(tpl_id: int) -> dict | None:
+    r = await pool.fetchrow("SELECT * FROM templates WHERE id=$1", tpl_id)
+    return dict(r) if r else None
+
+
+async def template_items(tpl_id: int) -> list[dict]:
+    return [dict(r) for r in await pool.fetch("SELECT * FROM template_items WHERE template_id=$1 ORDER BY pos", tpl_id)]
+
+
+async def delete_template(tpl_id: int) -> None:
+    await pool.execute("DELETE FROM templates WHERE id=$1", tpl_id)
