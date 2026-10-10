@@ -261,7 +261,7 @@ async def send_item(bot: Bot, chat, it: dict) -> list[int]:
     if it.get("src_msg") and (mt or hidden_preview(it)):
         # копируем исходное сообщение целиком: так сохраняются премиум-эмодзи и всё форматирование
         try:
-            extra = {"show_caption_above_media": True} if mt in ("photo", "video", "animation") and text else {}
+            extra = {"show_caption_above_media": True} if mt in ("photo", "video", "animation") and text and not it.get("cap_below") else {}
             copied = await bot.copy_message(chat, it["src_chat"], it["src_msg"], reply_markup=kb, **extra)
             return [copied.message_id]
         except Exception as e:
@@ -276,7 +276,7 @@ async def send_item(bot: Bot, chat, it: dict) -> list[int]:
     sender = {"photo": bot.send_photo, "video": bot.send_video, "animation": bot.send_animation, "voice": bot.send_voice, "audio": bot.send_audio,
               "document": bot.send_document}[mt]
     if len(text) <= 1024:
-        extra = {"show_caption_above_media": True} if mt in ("photo", "video", "animation") and text else {}
+        extra = {"show_caption_above_media": True} if mt in ("photo", "video", "animation") and text and not it.get("cap_below") else {}
         return [(await sender(chat, **{mt: fid}, caption=text or None, reply_markup=kb, **extra)).message_id]
     first = await bot.send_message(chat, text)
     second = await sender(chat, **{mt: fid}, reply_markup=kb)
@@ -911,7 +911,8 @@ async def _publish(bot: Bot, ch, it: dict) -> tuple[list[int], str]:
                                      it["media_url"] if it["media_type"] == "photo" else None, hidden_preview(it),
                                      it.get("plain"), it.get("ents"),
                                      media_type=it["media_type"] if has_media else None,
-                                     media_fallback=media_fallback if has_media else None)
+                                     media_fallback=media_fallback if has_media else None,
+                                     caption_below=bool(it.get("cap_below")))
             t1 = time.monotonic()
             while userbot.WARNINGS:
                 await notify(bot, f"⚠️ Пост #{it['id']}: {html.escape(userbot.WARNINGS.pop(0))}. Можно переопубликовать.")
@@ -1024,7 +1025,7 @@ async def live_edit(bot: Bot, it: dict, text: bool = False, btns: bool = False, 
                 from aiogram.types import InputMediaPhoto
                 await bot.edit_message_media(chat_id=ch, message_id=target, reply_markup=markup(it),
                                              media=InputMediaPhoto(media=it["file_id"], caption=(it["text_html"] or None) if single else None,
-                                                                   show_caption_above_media=True))
+                                                                   show_caption_above_media=not it.get("cap_below")))
         if text:
             body = it.get("plain") if it.get("plain") is not None else plain(it["text_html"])
             photo_card = it["media_url"] if it["media_type"] == "photo" else None
@@ -1585,9 +1586,10 @@ async def _bet_set(bot: Bot, tid: int, mp: dict, shot: str | None) -> int | None
         fields.update(bets.fill_item(fields, mp))
         if n == 0 and shot:
             fields.update(media_type="photo", file_id=shot, media_msg=None, media_ts=None, src_chat=None, src_msg=None,
-                          text_msg=None, text_ts=None, media_url=None)
-            await host_photo(bot, fields)
+                          text_msg=None, text_ts=None, media_url=None)   # обычное фото с подписью, без карточки-превью
         iid = await db.add_item(sid, ti["role"], ti.get("part") or 1, fields, "draft")
+        if n == 0 and shot:
+            await db.upd_item(iid, cap_below=True)
         ttl = ti["custom_ttl"]
         if ttl is None and ti["role"] == "reminder":
             ttl = TPL_REMINDER_TTL

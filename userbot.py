@@ -182,7 +182,7 @@ async def _send_framed(peer, text: str, ents, url: str) -> int:
     raise RuntimeError("не удалось получить id опубликованного сообщения")
 
 
-async def _send_bytes(peer, kind: str | None, data: bytes, name: str, text: str, ents) -> list[int]:
+async def _send_bytes(peer, kind: str | None, data: bytes, name: str, text: str, ents, caption_below: bool = False) -> list[int]:
     """Публикация медиа из скачанного файла (запасной путь, когда исходное сообщение в чате с ботом не найдено)."""
     def fresh():
         f = io.BytesIO(data)
@@ -199,7 +199,7 @@ async def _send_bytes(peer, kind: str | None, data: bytes, name: str, text: str,
         return [first.id, second.id]
     if kind in ("photo", "video", "animation") and text:
         try:
-            m = await client.send_file(peer, fresh(), caption=text, formatting_entities=ents, invert_media=True, **kw)
+            m = await client.send_file(peer, fresh(), caption=text, formatting_entities=ents, invert_media=not caption_below, **kw)
             return [m.id]
         except TypeError:
             pass
@@ -210,7 +210,7 @@ async def _send_bytes(peer, kind: str | None, data: bytes, name: str, text: str,
 async def send(ch, text_ts: int | None, media_ts: int | None, text_plain: str = "",
                media_url: str | None = None, keep_preview: bool = False,
                stored_text: str | None = None, stored_ents: str | None = None,
-               media_type: str | None = None, media_fallback=None) -> list[int]:
+               media_type: str | None = None, media_fallback=None, caption_below: bool = False) -> list[int]:
     peer = await _chan(ch)
     if stored_text is not None:
         tm = None
@@ -238,7 +238,7 @@ async def send(ch, text_ts: int | None, media_ts: int | None, text_plain: str = 
             if media_fallback:   # исходное сообщение в чате с ботом не нашли: берём файл у бота по file_id и загружаем сами
                 logging.warning("SEND via downloaded media: type=%s media_ts=%s", media_type, media_ts)
                 data, name = await media_fallback()
-                return await _send_bytes(peer, media_type, data, name, text, ents)
+                return await _send_bytes(peer, media_type, data, name, text, ents, caption_below)
             raise RuntimeError("исходное сообщение в чате с ботом не найдено (удалено или слишком старое?)")
         if mm.sticker or isinstance(mm.media, types.MessageMediaDice):   # стикеры и анимированные эмодзи: без подписи
             if isinstance(mm.media, types.MessageMediaDice):
@@ -251,7 +251,7 @@ async def send(ch, text_ts: int | None, media_ts: int | None, text_plain: str = 
                 m = await client.send_file(peer, mm.media, caption=text or None, formatting_entities=ents)
                 return [m.id]
             try:
-                m = await client.send_file(peer, mm.media, caption=text or None, formatting_entities=ents, invert_media=True)
+                m = await client.send_file(peer, mm.media, caption=text or None, formatting_entities=ents, invert_media=not caption_below)
             except TypeError:  # старая версия Telethon без invert_media
                 m = await client.send_file(peer, mm.media, caption=text or None, formatting_entities=ents)
             return [m.id]

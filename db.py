@@ -56,6 +56,7 @@ async def init(dsn: str) -> None:
         )
         """
     )
+    await pool.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS cap_below BOOLEAN NOT NULL DEFAULT FALSE")   # фото сверху, подпись под ним
     await pool.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS src_chat BIGINT")
     await pool.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS src_msg BIGINT")
     await pool.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS text_msg BIGINT")
