@@ -422,7 +422,8 @@ async def v_tpl(tid: int):
     lines += ["", "Напоминания без своего таймера удаляются через 2 минуты. Таймеры, которые ты задал, сохранены."]
     return "\n".join(lines[:60]), Kb(inline_keyboard=[
         [Btn(text="▶️ Создать набор из шаблона", callback_data=f"tu:{tid}")],
-        [Btn(text="🎯 Использовать для ставок", callback_data=f"bts:{tid}")],
+        [Btn(text="🎯 Шаблон ставки (со скрином)", callback_data=f"bts:{tid}")],
+        [Btn(text="🏦 Шаблон «Ставим | Банк»", callback_data=f"bts2:{tid}")],
         [Btn(text="🗑 Удалить шаблон", callback_data=f"td:{tid}"), Btn(text="◀️ Назад", callback_data="tpls")]])
 
 
@@ -1552,16 +1553,18 @@ async def bet_save(st: dict) -> None:
 
 async def v_bet():
     st = await bet_state()
-    tid = await db.get_setting("bet_tpl")
+    tid, tid2 = await db.get_setting("bet_tpl"), await db.get_setting("bet_tpl2")
     t = await db.get_template(int(tid)) if tid else None
+    t2 = await db.get_template(int(tid2)) if tid2 else None
     bank = st.get("bank")
     lines = ["<b>🎯 Ставка со скрина</b>", "",
-             f"Шаблон: {html.escape(t['name']) if t else 'не выбран'}",
+             f"Шаблон ставки (выходит со скрином): {html.escape(t['name']) if t else 'не выбран'}",
+             f"Шаблон «Ставим | Банк» (отдельным сообщением): {html.escape(t2['name']) if t2 else 'не выбран'}",
              f"Банк: {bets.money(bank) if bank is not None else 'не задан'}"]
     if st.get("last_stake"):
         lines.append(f"Прошлая ставка: {bets.money(st['last_stake'])} · " + ("победа учтена" if st.get("won") else "без победы: вычту её из банка"))
     lines += ["", "Метки для шаблона: {матч} (флаги и команды), {флаг1} {флаг2} {команда1} {команда2}, {исход}, {ставка}, {банк}, {коэф}.",
-              "Первое сообщение шаблона выйдет со скрином ставки."]
+              "Метки можно ставить в обоих шаблонах: в первом пост со скрином, во втором отдельное сообщение."]
     kb = [[Btn(text="📸 Прислать скрин ставки", callback_data="bgo")],
           [Btn(text="🏆 Банк из поста с победой", callback_data="bwin"), Btn(text="🏦 Задать банк", callback_data="bbank")],
           [Btn(text="📋 Выбрать шаблон", callback_data="tpls")],
@@ -1569,45 +1572,19 @@ async def v_bet():
     return "\n".join(lines), Kb(inline_keyboard=kb)
 
 
-async def make_bet(bot: Bot, file_id: str, d: dict, bank_override: int | None = None) -> bool:
-    """Собирает набор из шаблона ставок. False, если не хватает шаблона или банка (тогда пишет пользователю сам)."""
-    global mode
-    tid = await db.get_setting("bet_tpl")
-    t = await db.get_template(int(tid)) if tid else None
-    tis = await db.template_items(int(tid)) if t else []
+async def _bet_set(bot: Bot, tid: int, mp: dict, shot: str | None) -> int | None:
+    """Черновик из шаблона с подставленными метками. shot: file_id скрина для первого сообщения."""
+    t = await db.get_template(tid)
+    tis = await db.template_items(tid) if t else []
     if not tis:
-        await tmp(bot, "Сначала выбери шаблон ставок: «Из шаблона» → шаблон → «🎯 Использовать для ставок».")
-        return False
-    if not bets.has_tokens(tis):
-        await tmp(bot, "В шаблоне нет меток вроде {матч}, {исход}, {ставка}, {банк}. Добавь их в текст шаблона и повтори.")
-        return False
-    st = await bet_state()
-    old = st.get("sid")
-    if old and st.get("prev") is not None:   # прошлый пост ставки так и не запущен: откатываем банк и заменяем черновик
-        s_old = await db.get_set(old)
-        if not s_old or s_old["status"] == "draft":
-            st = dict(st["prev"])
-            if s_old:
-                await db.delete_set(old)
-    if bank_override is not None:
-        bank, why = bank_override, "задан вручную"
-    else:
-        bank, why = bets.next_bank(st, d["stake"])
-    if bank is None:
-        global bet_wait
-        bet_wait = (file_id, d)
-        mode = ("bbank0",)
-        await tmp(bot, "Банк ещё не задан. Напиши текущий банк числом, например 250000.",
-                  Kb(inline_keyboard=[[Btn(text="Отмена", callback_data="cancel")]]))
-        return False
-    mp = bets.values(d, bank)
+        return None
     sid = await db.new_set(t["kind"])
-    await db.upd_set(sid, tpl_id=int(tid))
+    await db.upd_set(sid, tpl_id=tid)
     for n, ti in enumerate(tis):
         fields = {k: ti.get(k) for k in db.TPL_FIELDS}
         fields.update(bets.fill_item(fields, mp))
-        if n == 0:
-            fields.update(media_type="photo", file_id=file_id, media_msg=None, media_ts=None, src_chat=None, src_msg=None,
+        if n == 0 and shot:
+            fields.update(media_type="photo", file_id=shot, media_msg=None, media_ts=None, src_chat=None, src_msg=None,
                           text_msg=None, text_ts=None, media_url=None)
             await host_photo(bot, fields)
         iid = await db.add_item(sid, ti["role"], ti.get("part") or 1, fields, "draft")
@@ -1619,15 +1596,57 @@ async def make_bet(bot: Bot, file_id: str, d: dict, bank_override: int | None = 
     items = await db.items_of(sid)
     if t["kind"] != "single" and items:
         await db.upd_set(sid, next_role=next_role_after(t["kind"], items, items[-1]["role"]))
+    return sid
+
+
+async def make_bet(bot: Bot, file_id: str, d: dict, bank_override: int | None = None) -> bool:
+    """Собирает черновики из шаблонов ставки. False, если не хватает шаблона или банка (тогда пишет пользователю сам)."""
+    global mode, bet_wait
+    tid = await db.get_setting("bet_tpl")
+    tid2 = await db.get_setting("bet_tpl2")
+    tis = await db.template_items(int(tid)) if tid else []
+    if not tis:
+        await tmp(bot, "Сначала выбери шаблон ставки: «Из шаблона» → шаблон → «🎯 Шаблон ставки».")
+        return False
+    tis2 = await db.template_items(int(tid2)) if tid2 else []
+    if not bets.has_tokens(tis + tis2):
+        await tmp(bot, "В шаблонах нет меток вроде {матч}, {исход}, {ставка}, {банк}. Добавь их в текст шаблона и повтори.")
+        return False
+    st = await bet_state()
+    old = st.get("sids") or []
+    if old and st.get("prev") is not None:   # прошлый пост ставки так и не запущен: откатываем банк и заменяем черновики
+        s_old = [await db.get_set(i) for i in old]
+        if not s_old[0] or s_old[0]["status"] == "draft":
+            st = dict(st["prev"])
+            for i, s in zip(old, s_old):
+                if s and s["status"] == "draft":
+                    await db.delete_set(i)
+    if bank_override is not None:
+        bank, why = bank_override, "задан вручную"
+    else:
+        bank, why = bets.next_bank(st, d["stake"])
+    if bank is None:
+        bet_wait = (file_id, d)
+        mode = ("bbank0",)
+        await tmp(bot, "Банк ещё не задан. Напиши текущий банк числом, например 250000.",
+                  Kb(inline_keyboard=[[Btn(text="Отмена", callback_data="cancel")]]))
+        return False
+    mp = bets.values(d, bank)
+    sid = await _bet_set(bot, int(tid), mp, file_id)
+    sid2 = await _bet_set(bot, int(tid2), mp, None) if tis2 else None
+    sids = [i for i in (sid, sid2) if i]
     await db.drop_empty_drafts(except_id=sid)
     prev = {k: st.get(k) for k in ("bank", "last_stake", "won")}
-    await bet_save({"bank": bank, "last_stake": d["stake"], "won": False, "sid": sid, "prev": prev, "ctx": {"file_id": file_id, "d": d}})
+    await bet_save({"bank": bank, "last_stake": d["stake"], "won": False, "sids": sids, "prev": prev, "ctx": {"file_id": file_id, "d": d}})
     await open_view(bot, ("draft", sid), fresh=True)
     cur = d.get("currency") or "₽"
+    row = [Btn(text="🚀 Опубликовать оба" if sid2 else "🚀 Опубликовать", callback_data=f"bpub:{sid}:{sid2 or 0}")]
+    if sid2:
+        row.append(Btn(text="📄 Сообщение 2", callback_data=f"dv:{sid2}"))
     await tmp(bot, f"🎯 {html.escape(mp['{матч}'])}\n{html.escape(mp['{исход}'])} · коэф. {mp['{коэф}']}\n"
                    f"Ставка: {bets.money(d['stake'], cur)} · Банк: {bets.money(bank, cur)} ({why})\n\n"
-                   "Проверь черновик и запускай. Если банк другой, нажми «✏️ Банк».",
-              Kb(inline_keyboard=[[Btn(text="✏️ Банк", callback_data=f"bfix:{sid}")]]))
+                   "Проверь черновик" + (" и сообщение 2" if sid2 else "") + ". Если банк другой, нажми «✏️ Банк».",
+              Kb(inline_keyboard=[row, [Btn(text="✏️ Банк", callback_data="bfix:0")]]))
     return True
 
 
@@ -1783,6 +1802,26 @@ async def on_cb(c: CallbackQuery, bot: Bot):
         if not bets.has_tokens(tis):
             await tmp(bot, "Шаблон выбран, но в нём нет меток {матч}, {исход}, {ставка}, {банк}. Добавь их в текст и обнови шаблон.")
         await c.answer("Шаблон ставок выбран")
+        return
+    if action == "bts2":
+        await db.set_setting("bet_tpl2", str(int(parts[0])))
+        await open_view(bot, ("bet",))
+        await c.answer("Шаблон «Ставим | Банк» выбран")
+        return
+    if action == "bpub":
+        sid, sid2 = int(parts[0]), int(parts[1])
+        s2 = await db.get_set(sid2) if sid2 else None
+        if s2 and s2["status"] == "draft":   # второе сообщение уходит через полминуты после первого
+            await db.upd_set(sid2, start_at=now() + timedelta(seconds=30))
+        err = await launch(bot, sid)
+        if err:
+            await c.answer(err, show_alert=True)
+            return
+        err2 = await launch(bot, sid2) if s2 and s2["status"] == "draft" else None
+        text = await summary(sid) + (("\n\n" + await summary(sid2)) if sid2 and not err2 else "")
+        await open_view(bot, None)
+        await bot.send_message(ADMIN, text + (f"\n\n⚠️ Сообщение 2 не запущено: {err2}" if err2 else ""))
+        await c.answer()
         return
     if action == "bgo":
         await clear_tmp(bot)
