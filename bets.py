@@ -168,10 +168,14 @@ def fill_item(d: dict, mp: dict) -> dict:
     return upd
 
 
-def has_tokens(items: list[dict]) -> bool:
+MATCH_TOKENS = ("{матч}", "{флаг1}", "{флаг2}", "{команда1}", "{команда2}", "{исход}", "{коэф}")
+MONEY_TOKENS = ("{ставка}", "{банк}")
+
+
+def has_tokens(items: list[dict], tokens: tuple = TOKENS) -> bool:
     for it in items:
         blob = " ".join(str(it.get(f) or "") for f in ("text_html", "plain", "btns", "btn_text", "btn_url"))
-        if any(t in blob for t in TOKENS):
+        if any(t in blob for t in tokens):
             return True
     return False
 

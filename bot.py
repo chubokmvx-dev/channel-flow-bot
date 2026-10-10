@@ -1609,8 +1609,8 @@ async def make_bet(bot: Bot, file_id: str, d: dict, bank_override: int | None = 
         await tmp(bot, "Сначала выбери шаблон ставки: «Из шаблона» → шаблон → «🎯 Шаблон ставки».")
         return False
     tis2 = await db.template_items(int(tid2)) if tid2 else []
-    if not bets.has_tokens(tis + tis2):
-        await tmp(bot, "В шаблонах нет меток вроде {матч}, {исход}, {ставка}, {банк}. Добавь их в текст шаблона и повтори.")
+    if not bets.has_tokens(tis, bets.MATCH_TOKENS) and not (tis2 and bets.has_tokens(tis2, bets.MONEY_TOKENS)):
+        await tmp(bot, "В шаблоне ставки нет меток {матч} или {исход}, а во втором нет {ставка} или {банк}. Добавь метки в текст и повтори.")
         return False
     st = await bet_state()
     old = st.get("sids") or []
@@ -1799,13 +1799,16 @@ async def on_cb(c: CallbackQuery, bot: Bot):
         tis = await db.template_items(tid)
         await db.set_setting("bet_tpl", str(tid))
         await open_view(bot, ("bet",))
-        if not bets.has_tokens(tis):
-            await tmp(bot, "Шаблон выбран, но в нём нет меток {матч}, {исход}, {ставка}, {банк}. Добавь их в текст и обнови шаблон.")
+        if not bets.has_tokens(tis, bets.MATCH_TOKENS):
+            await tmp(bot, "Шаблон выбран, но в тексте нет меток {матч} или {исход}. Добавь их в этот шаблон и обнови его. "
+                           "{ставка} и {банк} здесь не нужны: они идут во втором шаблоне.")
         await c.answer("Шаблон ставок выбран")
         return
     if action == "bts2":
         await db.set_setting("bet_tpl2", str(int(parts[0])))
         await open_view(bot, ("bet",))
+        if not bets.has_tokens(await db.template_items(int(parts[0])), bets.MONEY_TOKENS):
+            await tmp(bot, "Шаблон выбран, но в тексте нет меток {ставка} или {банк}. Добавь их и обнови шаблон.")
         await c.answer("Шаблон «Ставим | Банк» выбран")
         return
     if action == "bpub":
