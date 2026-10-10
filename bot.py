@@ -424,6 +424,7 @@ async def v_tpl(tid: int):
         [Btn(text="▶️ Создать набор из шаблона", callback_data=f"tu:{tid}")],
         [Btn(text="🎯 Шаблон ставки (со скрином)", callback_data=f"bts:{tid}")],
         [Btn(text="🏦 Шаблон «Ставим | Банк»", callback_data=f"bts2:{tid}")],
+        [Btn(text="💬 Шаблон «Поддержка» (сообщение 3)", callback_data=f"bts3:{tid}")],
         [Btn(text="🗑 Удалить шаблон", callback_data=f"td:{tid}"), Btn(text="◀️ Назад", callback_data="tpls")]])
 
 
@@ -1554,13 +1555,15 @@ async def bet_save(st: dict) -> None:
 
 async def v_bet():
     st = await bet_state()
-    tid, tid2 = await db.get_setting("bet_tpl"), await db.get_setting("bet_tpl2")
+    tid, tid2, tid3 = await db.get_setting("bet_tpl"), await db.get_setting("bet_tpl2"), await db.get_setting("bet_tpl3")
     t = await db.get_template(int(tid)) if tid else None
     t2 = await db.get_template(int(tid2)) if tid2 else None
+    t3 = await db.get_template(int(tid3)) if tid3 else None
     bank = st.get("bank")
     lines = ["<b>🎯 Ставка со скрина</b>", "",
              f"Шаблон ставки (выходит со скрином): {html.escape(t['name']) if t else 'не выбран'}",
              f"Шаблон «Ставим | Банк» (отдельным сообщением): {html.escape(t2['name']) if t2 else 'не выбран'}",
+             f"Шаблон «Поддержка» (отдельным сообщением): {html.escape(t3['name']) if t3 else 'не выбран'}",
              f"Банк: {bets.money(bank) if bank is not None else 'не задан'}"]
     if st.get("last_stake"):
         lines.append(f"Прошлая ставка: {bets.money(st['last_stake'])} · " + ("победа учтена" if st.get("won") else "без победы: вычту её из банка"))
@@ -1568,8 +1571,10 @@ async def v_bet():
               "Метки можно ставить в обоих шаблонах: в первом пост со скрином, во втором отдельное сообщение."]
     kb = [[Btn(text="📸 Прислать скрин ставки", callback_data="bgo")],
           [Btn(text="🏆 Банк из поста с победой", callback_data="bwin"), Btn(text="🏦 Задать банк", callback_data="bbank")],
-          [Btn(text="📋 Выбрать шаблон", callback_data="tpls")],
-          [Btn(text="◀️ Назад", callback_data="menu")]]
+          [Btn(text="📋 Выбрать шаблон", callback_data="tpls")]]
+    if t3:
+        kb.append([Btn(text="💬 Выключить сообщение 3", callback_data="bclr3")])
+    kb.append([Btn(text="◀️ Назад", callback_data="menu")])
     return "\n".join(lines), Kb(inline_keyboard=kb)
 
 
@@ -1606,6 +1611,7 @@ async def make_bet(bot: Bot, file_id: str, d: dict, bank_override: int | None = 
     global mode, bet_wait
     tid = await db.get_setting("bet_tpl")
     tid2 = await db.get_setting("bet_tpl2")
+    tid3 = await db.get_setting("bet_tpl3")
     tis = await db.template_items(int(tid)) if tid else []
     if not tis:
         await tmp(bot, "Сначала выбери шаблон ставки: «Из шаблона» → шаблон → «🎯 Шаблон ставки».")
@@ -1636,18 +1642,21 @@ async def make_bet(bot: Bot, file_id: str, d: dict, bank_override: int | None = 
     mp = bets.values(d, bank)
     sid = await _bet_set(bot, int(tid), mp, file_id)
     sid2 = await _bet_set(bot, int(tid2), mp, None) if tis2 else None
-    sids = [i for i in (sid, sid2) if i]
+    sid3 = await _bet_set(bot, int(tid3), mp, None) if tid3 else None
+    sids = [i for i in (sid, sid2, sid3) if i]
     await db.drop_empty_drafts(except_id=sid)
     prev = {k: st.get(k) for k in ("bank", "last_stake", "won")}
     await bet_save({"bank": bank, "last_stake": d["stake"], "won": False, "sids": sids, "prev": prev, "ctx": {"file_id": file_id, "d": d}})
     await open_view(bot, ("draft", sid), fresh=True)
     cur = d.get("currency") or "₽"
-    row = [Btn(text="🚀 Опубликовать оба" if sid2 else "🚀 Опубликовать", callback_data=f"bpub:{sid}:{sid2 or 0}")]
+    row = [Btn(text="🚀 Опубликовать все" if len(sids) > 1 else "🚀 Опубликовать", callback_data=f"bpub:{sid}:{sid2 or 0}:{sid3 or 0}")]
     if sid2:
         row.append(Btn(text="📄 Сообщение 2", callback_data=f"dv:{sid2}"))
+    if sid3:
+        row.append(Btn(text="📄 Сообщение 3", callback_data=f"dv:{sid3}"))
     await tmp(bot, f"🎯 {html.escape(mp['{матч}'])}\n{html.escape(mp['{исход}'])} · коэф. {mp['{коэф}']}\n"
                    f"Ставка: {bets.money(d['stake'], cur)} · Банк: {bets.money(bank, cur)} ({why})\n\n"
-                   "Проверь черновик" + (" и сообщение 2" if sid2 else "") + ". Если банк другой, нажми «✏️ Банк».",
+                   "Проверь черновик" + (" и остальные сообщения" if len(sids) > 1 else "") + ". Если банк другой, нажми «✏️ Банк».",
               Kb(inline_keyboard=[row, [Btn(text="✏️ Банк", callback_data="bfix:0")]]))
     return True
 
@@ -1814,19 +1823,35 @@ async def on_cb(c: CallbackQuery, bot: Bot):
         await c.answer("Шаблон «Ставим | Банк» выбран")
         return
     if action == "bpub":
-        sid, sid2 = int(parts[0]), int(parts[1])
-        s2 = await db.get_set(sid2) if sid2 else None
-        if s2 and s2["status"] == "draft":   # второе сообщение уходит сразу за первым (секундой позже, чтобы порядок не перепутался)
-            await db.upd_set(sid2, start_at=now() + timedelta(seconds=2))
-        err = await launch(bot, sid)
-        if err:
-            await c.answer(err, show_alert=True)
-            return
-        err2 = await launch(bot, sid2) if s2 and s2["status"] == "draft" else None
-        text = await summary(sid) + (("\n\n" + await summary(sid2)) if sid2 and not err2 else "")
+        ids = [int(x) for x in parts if int(x)]
+        texts, errs = [], []
+        for n, sid in enumerate(ids):
+            s = await db.get_set(sid)
+            if not s or s["status"] != "draft":
+                continue
+            if n:   # каждое следующее сообщение уходит сразу за предыдущим, на пару секунд позже
+                await db.upd_set(sid, start_at=now() + timedelta(seconds=2 * n))
+            err = await launch(bot, sid)
+            if err:
+                if n == 0:
+                    await c.answer(err, show_alert=True)
+                    return
+                errs.append(f"сообщение {n + 1}: {err}")
+            else:
+                texts.append(await summary(sid))
         await open_view(bot, None)
-        await bot.send_message(ADMIN, text + (f"\n\n⚠️ Сообщение 2 не запущено: {err2}" if err2 else ""))
+        await bot.send_message(ADMIN, "\n\n".join(texts) + ("\n\n⚠️ Не запущено: " + "; ".join(errs) if errs else ""))
         await c.answer()
+        return
+    if action == "bts3":
+        await db.set_setting("bet_tpl3", str(int(parts[0])))
+        await open_view(bot, ("bet",))
+        await c.answer("Шаблон «Поддержка» выбран")
+        return
+    if action == "bclr3":
+        await db.set_setting("bet_tpl3", "")
+        await open_view(bot, ("bet",))
+        await c.answer("Третье сообщение выключено")
         return
     if action == "bgo":
         await clear_tmp(bot)
