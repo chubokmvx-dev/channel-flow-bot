@@ -1816,8 +1816,8 @@ async def on_cb(c: CallbackQuery, bot: Bot):
     if action == "bpub":
         sid, sid2 = int(parts[0]), int(parts[1])
         s2 = await db.get_set(sid2) if sid2 else None
-        if s2 and s2["status"] == "draft":   # второе сообщение уходит через полминуты после первого
-            await db.upd_set(sid2, start_at=now() + timedelta(seconds=30))
+        if s2 and s2["status"] == "draft":   # второе сообщение уходит сразу за первым (секундой позже, чтобы порядок не перепутался)
+            await db.upd_set(sid2, start_at=now() + timedelta(seconds=2))
         err = await launch(bot, sid)
         if err:
             await c.answer(err, show_alert=True)
